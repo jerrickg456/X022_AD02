@@ -142,12 +142,55 @@ $$d = \left(\frac{P_{1\text{m}}}{\max(P_0, P_1) + \epsilon}\right)^{\frac{1}{\ga
 
 ---
 
-## 7. System Architecture & Native DSP Implementation
+## 7. Receiver Validation Before Sending & Targeted Unicast Protocol
+
+To guarantee confidential delivery and verify receiver availability prior to transmission, SonicMesh implements **Acoustic Receiver Validation**.
+
+```
+  SENDER (Node A)                              RECEIVER (Node B)
+        |                                              |
+        | ----------- Acoustic PING (0x02) ----------> | (Nearby discovery broadcast)
+        |                                              |
+        | <---------- Acoustic PONG (0x06) ----------- | (Device ID, Fingerprint, Name)
+        |                                              |
+[Selects B from list]                                  |
+        |                                              |
+        | ----- PRIVATE_MESSAGE (0x07, Target=B) ----> | (Encrypted/addressed to B)
+        |                                              | [Receiver ID matches: Decrypts]
+        |                                              | [Other nodes: Silently ignore]
+        |                                              |
+        | <--------- Acoustic ACK (0x03) ------------- | (Signed delivery receipt)
+        |                                              |
+[Status: DELIVERED]                                    |
+```
+
+### 7.1 Persistent Device Identity & Key Derivation (`IdentityManager.kt`)
+* **Device ID:** Unique 32-bit integer persisted in `SharedPreferences`, displayed in formatted hex `SM-XXXX` (e.g. `1A2B-3C4D`).
+* **Device Name:** Human-readable moniker (e.g. `Sonic-1A2B`).
+* **Public Key Fingerprint:** Synthetic ECDSA P-256 public key hash (`SHA-256` derived, formatted `XXXX-XXXX`).
+
+### 7.2 Packet Format & Unicast Addressing
+1. **PING Packet (`0x02`):**
+   * Payload: `senderId (4B) | nonce (2B)`
+   * Function: Broadcasted to wake and query active receivers.
+2. **PONG Packet (`0x06`):**
+   * Payload: `targetSenderId (4B) | responderId (4B) | fingerprint (4B) | nameLen (1B) | nameBytes`
+   * Function: Responded autonomously with acoustic backoff ($250\text{ ms} - 450\text{ ms}$) to avoid air collision.
+3. **PRIVATE_MESSAGE Packet (`0x07`):**
+   * Header: `senderId (4B) | receiverId (4B) | msgId (2B) | payloadText`
+   * Filtering: If `packet.receiverId == myIdentity.deviceId`, decrypt and display. If mismatch, silently drop and record `unaddressed packet ignored`.
+4. **ACK Packet (`0x03`):**
+   * Header: `senderId (4B) | receiverId (4B) | msgId (2B)`
+   * Function: Autonomously emitted by the target recipient. Sender transitions message status to `DELIVERED [VERIFIED ACK]`.
+
+---
+
+## 8. System Architecture & Native DSP Implementation
 
 ```
 +-------------------------------------------------------------+
 |                      FLUTTER UI LAYER                       |
-|   (Theme / Routes / Broadcast / Receiver / Range / Diag)    |
+|   (Theme / Routes / Broadcast / Receiver / Range / Private) |
 +-------------------------------------------------------------+
                               |
     MethodChannel ("control") | EventChannel ("events")
@@ -156,47 +199,48 @@ $$d = \left(\frac{P_{1\text{m}}}{\max(P_0, P_1) + \epsilon}\right)^{\frac{1}{\ga
 |                     ANDROID KOTLIN NATIVE                   |
 |                   com.sonicmesh.app.acoustic                |
 |                                                             |
-|  +----------------+  +----------------+  +---------------+  |
-|  | Modulator.kt   |  | AudioPlayer.kt |  | Packet.kt     |  |
-|  +----------------+  +----------------+  +---------------+  |
+|  +-------------------+  +----------------+  +------------+  |
+|  | IdentityManager.kt|  | AudioPlayer.kt |  | Packet.kt  |  |
+|  +-------------------+  +----------------+  +------------+  |
 |                                                             |
-|  +----------------+  +----------------+  +---------------+  |
-|  | Demodulator.kt |  | AudioCapture.kt|  | Goertzel.kt   |  |
-|  +----------------+  +----------------+  +---------------+  |
+|  +-------------------+  +----------------+  +------------+  |
+|  | AcousticEngine.kt |  | AudioCapture.kt|  | Goertzel.kt|  |
+|  +-------------------+  +----------------+  +------------+  |
 |                                                             |
-|  +----------------+  +----------------+  +---------------+  |
-|  | SignalDetector |  | AcousticEngine |  | Crc32.kt      |  |
-|  +----------------+  +----------------+  +---------------+  |
+|  +-------------------+  +----------------+  +------------+  |
+|  | Modulator.kt      |  | Demodulator.kt |  | Detector.kt|  |
+|  +-------------------+  +----------------+  +------------+  |
 +-------------------------------------------------------------+
 ```
 
-### 7.1 Native Kotlin DSP Components
-* **`AcousticEngine.kt`:** Finite state machine (`IDLE`, `TRANSMITTING`, `LISTENING`, `RECEIVING`, `RECOVERING`). Manages $30\text{-second}$ circular audio history, burst lifecycle, ARQ reassembly, and telemetry dispatch.
-* **`Modulator.kt`:** Converts byte frames into continuous-phase sine wave PCM samples with raised-cosine envelopes.
-* **`Demodulator.kt`:** Over-the-air demodulator with:
-  * Automatic frequency response gain balancing (compensating for $17.5\text{ kHz}$ microphone attenuation).
-  * Center 50% symbol windowing in Goertzel DFT to eliminate inter-symbol interference and edge multipath.
-  * 8-phase clock synchronization.
-  * Hamming distance $\le 1$ tolerant sync word matching with CRC-32 validation.
-* **`Goertzel.kt`:** Second-order IIR filter computing discrete Fourier transform power at specific target frequencies with $O(N)$ efficiency.
-* **`SignalDetector.kt`:** Real-time carrier energy detection, RMS level measurement, SNR estimation, and acoustic distance computation.
-* **`AudioCapture.kt`:** Non-blocking PCM capture using `AudioRecord` (`VOICE_RECOGNITION` source fallback).
-* **`AudioPlayer.kt`:** Low-latency PCM playback using `AudioTrack`.
+### 8.1 Native Kotlin DSP Components
+* **`IdentityManager.kt`:** Generates, stores, and supplies unique device identity, friendly name, and synthetic ECDSA fingerprint.
+* **`AcousticEngine.kt`:** Finite state machine managing audio streams, PING/PONG discovery loops, targeted unicast filtering, ACK verification, and ARQ reassembly.
+* **`Packet.kt`:** Binary serialization/deserialization for DATA (`0x01`), PING (`0x02`), ACK (`0x03`), RETRANS_REQ (`0x04`), RETRANS_RESP (`0x05`), PONG (`0x06`), and PRIVATE_MESSAGE (`0x07`).
+* **`Modulator.kt`:** Continuous-phase FSK modulator.
+* **`Demodulator.kt`:** Robust over-the-air Goertzel detector with gain tilt balancing and windowed sync matching.
+* **`SignalDetector.kt`:** RMS level measurement and real-time acoustic Range Meter estimation.
 
 ---
 
-## 8. User Interface & Experience Design
+## 9. User Interface & Experience Design
 
 * **Design Philosophy:** Cyberpunk military-grade tactical dark mode with glassmorphic cards, glowing cyan/teal accents, and monospace telemetry.
-* **Haptic Feedback:** Tactile impact on carrier lock and successful packet arrival.
 * **Interactive Consoles:**
-  * **Broadcast Console:** Text entry, payload byte count, dynamic duration estimation, quick dispatch presets (`HELLO MESH`, `SOS: Medical Needed Grid 4`), proactive redundancy selector (`1x`, `2x`, `3x`), and live autonomous relay activity log.
-  * **Receiver & Range Console:** Animated radar ring indicator, real-time Acoustic Range Meter ($2.1\text{ m}$ readout, proximity zone badge, SNR in dB), live carrier intensity bar, Incomplete Reception Recovery banner with manual/auto-NACK trigger, and verified message cards with copy actions.
-  * **DSP Diagnostics Console:** Complete compliance policy review, in-memory encode-modulate-demodulate loopback testing, and live PHY parameters display.
+  * **Validate & Private Chat:**
+    * My Identity Banner (Device ID `SM-XXXX`, ECDSA key fingerprint).
+    * Ultrasonic radar ping pulse controller.
+    * Nearby Discovered Devices list with live Range Meter distance (`~0.8m`, `~1.5m`).
+    * Targeted recipient selection & unicast packet composer.
+    * Real-time delivery status badge (`DELIVERED [VERIFIED ACK]`).
+    * Private inbox with unaddressed message filtering.
+  * **Broadcast Console:** One-to-many broadcast with redundancy (`1x`, `2x`, `3x`) and autonomous ARQ cache.
+  * **Receiver & Range Console:** Live carrier detection, real-time Range Meter distance bar, incomplete reception recovery, and auto-NACK retransmission.
+  * **DSP Diagnostics Console:** Encode-modulate-demodulate loopback testing, identity inspector, and PHY parameters display.
 
 ---
 
-## 9. Hardware & Operating Environment
+## 10. Hardware & Operating Environment
 
 * **Target OS:** Android 7.0+ (API Level 24 through 35+).
 * **Validated Device:** `iQOO I2223` (Android 15, API 35, ARM64-v8a).
@@ -206,7 +250,7 @@ $$d = \left(\frac{P_{1\text{m}}}{\max(P_0, P_1) + \epsilon}\right)^{\frac{1}{\ga
 
 ---
 
-## 10. Verification Matrix
+## 11. Verification Matrix
 
 | Test Suite | Target | Status |
 | :--- | :--- | :--- |
@@ -215,6 +259,9 @@ $$d = \left(\frac{P_{1\text{m}}}{\max(P_0, P_1) + \epsilon}\right)^{\frac{1}{\ga
 | `testDemodulationWithChannelGainTilt` | Phone mic high-frequency roll-off (6 dB tilt) | **PASSED** |
 | `testRetransmissionRequestPacket` | NACK packet encoding, parsing, and CRC verification | **PASSED** |
 | `testRangeMeterDistanceEstimation` | Log-distance path loss distance calculation | **PASSED** |
+| `testPingPongPacketEncodingAndParsing` | Acoustic PING broadcast & PONG discovery response parsing | **PASSED** |
+| `testPrivateMessageTargetingAndAck` | Targeted unicast filtering & signed acoustic ACK verification | **PASSED** |
+| `testIdentityGeneration` | Persistent device ID, hex formatting, and ECDSA fingerprint generation | **PASSED** |
 | `flutter test` | Flutter widget hierarchy and routing test suite | **PASSED** |
 | `Live Hardware Validation` | Live Carrier Lock, 2.1m Range Meter, UI telemetry on real phone | **PASSED** |
 | `Git Synchronization` | Remote push to `origin main` on GitHub | **PASSED** |
