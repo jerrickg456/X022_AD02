@@ -14,8 +14,17 @@ data class SonicIdentity(
 
 class IdentityManager(private val context: Context? = null) {
 
-    val identity: SonicIdentity by lazy {
-        loadOrCreateIdentity()
+    var identity: SonicIdentity = loadOrCreateIdentity()
+        private set
+
+    fun renameDevice(newName: String): Boolean {
+        val prefs = context?.getSharedPreferences("sonicmesh_identity", Context.MODE_PRIVATE)
+            ?: return false
+        val trimmed = newName.trim().take(20)
+        if (trimmed.isEmpty()) return false
+        prefs.edit().putString("device_name", trimmed).apply()
+        identity = loadOrCreateIdentity()
+        return true
     }
 
     private fun loadOrCreateIdentity(): SonicIdentity {

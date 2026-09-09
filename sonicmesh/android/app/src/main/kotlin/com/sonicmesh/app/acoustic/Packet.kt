@@ -11,6 +11,29 @@ data class AcousticPacket(
     val totalPackets: Short = 1,
     val payload: ByteArray
 ) {
+    data class ImageStartData(
+        val imageId: Int,
+        val width: Short,
+        val height: Short,
+        val fileSize: Int,
+        val format: Byte,
+        val totalChunks: Short,
+        val chunkSize: Short
+    )
+
+    data class ImageChunkData(
+        val imageId: Int,
+        val chunkIndex: Short,
+        val totalChunks: Short,
+        val chunkData: ByteArray
+    )
+
+    data class ImageEndData(
+        val imageId: Int,
+        val totalChunks: Short,
+        val imageCrc32: Int
+    )
+
     companion object {
         const val TYPE_DATA: Byte = 0x01
         const val TYPE_PING: Byte = 0x02
@@ -223,6 +246,139 @@ data class AcousticPacket(
                 senderId = senderId,
                 receiverId = receiverId,
                 msgId = msgId
+            )
+        }
+
+        const val TYPE_IMAGE_START: Byte = 0x10
+        const val TYPE_IMAGE_CHUNK: Byte = 0x11
+        const val TYPE_IMAGE_END: Byte = 0x12
+
+        const val FORMAT_WEBP: Byte = 0x01
+        const val FORMAT_JPEG: Byte = 0x02
+        const val FORMAT_PNG: Byte = 0x03
+
+
+        fun createImageStartPacket(
+            imageId: Int,
+            width: Short,
+            height: Short,
+            fileSize: Int,
+            format: Byte = FORMAT_WEBP,
+            totalChunks: Short,
+            chunkSize: Short = 48,
+            version: Byte = 1
+        ): AcousticPacket {
+            val payload = ByteArray(4 + 2 + 2 + 4 + 1 + 2 + 2)
+            val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+            buf.putInt(imageId)
+            buf.putShort(width)
+            buf.putShort(height)
+            buf.putInt(fileSize)
+            buf.put(format)
+            buf.putShort(totalChunks)
+            buf.putShort(chunkSize)
+
+            return AcousticPacket(
+                version = version,
+                type = TYPE_IMAGE_START,
+                sequenceNumber = 1,
+                totalPackets = totalChunks,
+                payload = payload
+            )
+        }
+
+        fun parseImageStart(packet: AcousticPacket): ImageStartData? {
+            if (packet.type != TYPE_IMAGE_START || packet.payload.size < 17) return null
+            val buf = ByteBuffer.wrap(packet.payload).order(ByteOrder.BIG_ENDIAN)
+            val imageId = buf.int
+            val width = buf.short
+            val height = buf.short
+            val fileSize = buf.int
+            val format = buf.get()
+            val totalChunks = buf.short
+            val chunkSize = buf.short
+            return ImageStartData(
+                imageId = imageId,
+                width = width,
+                height = height,
+                fileSize = fileSize,
+                format = format,
+                totalChunks = totalChunks,
+                chunkSize = chunkSize
+            )
+        }
+
+        fun createImageChunkPacket(
+            imageId: Int,
+            chunkIndex: Short,
+            totalChunks: Short,
+            chunkData: ByteArray,
+            version: Byte = 1
+        ): AcousticPacket {
+            val payload = ByteArray(4 + 2 + 2 + chunkData.size)
+            val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+            buf.putInt(imageId)
+            buf.putShort(chunkIndex)
+            buf.putShort(chunkData.size.toShort())
+            buf.put(chunkData)
+
+            return AcousticPacket(
+                version = version,
+                type = TYPE_IMAGE_CHUNK,
+                sequenceNumber = chunkIndex,
+                totalPackets = totalChunks,
+                payload = payload
+            )
+        }
+
+        fun parseImageChunk(packet: AcousticPacket): ImageChunkData? {
+            if (packet.type != TYPE_IMAGE_CHUNK || packet.payload.size < 8) return null
+            val buf = ByteBuffer.wrap(packet.payload).order(ByteOrder.BIG_ENDIAN)
+            val imageId = buf.int
+            val chunkIndex = buf.short
+            val len = buf.short.toInt() and 0xFFFF
+            if (buf.remaining() < len) return null
+            val data = ByteArray(len)
+            buf.get(data)
+            return ImageChunkData(
+                imageId = imageId,
+                chunkIndex = chunkIndex,
+                totalChunks = packet.totalPackets,
+                chunkData = data
+            )
+        }
+
+        fun createImageEndPacket(
+            imageId: Int,
+            totalChunks: Short,
+            imageCrc32: Int,
+            version: Byte = 1
+        ): AcousticPacket {
+            val payload = ByteArray(4 + 2 + 4)
+            val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+            buf.putInt(imageId)
+            buf.putShort(totalChunks)
+            buf.putInt(imageCrc32)
+
+            return AcousticPacket(
+                version = version,
+                type = TYPE_IMAGE_END,
+                sequenceNumber = totalChunks,
+                totalPackets = totalChunks,
+                payload = payload
+            )
+        }
+
+        fun parseImageEnd(packet: AcousticPacket): ImageEndData? {
+            if (packet.type != TYPE_IMAGE_END || packet.payload.size < 10) return null
+            val buf = ByteBuffer.wrap(packet.payload).order(ByteOrder.BIG_ENDIAN)
+            val imageId = buf.int
+            val totalChunks = buf.short
+            val imageCrc32 = buf.int
+            return ImageEndData(
+                imageId = imageId,
+                totalChunks = totalChunks,
+                imageCrc32 = imageCrc32
             )
         }
     }

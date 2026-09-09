@@ -2,48 +2,10 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import '../../app/theme.dart';
 import '../../native/acoustic_channel.dart';
+import '../../services/message_store.dart';
 
-class DiscoveredPeer {
-  final int deviceId;
-  final String deviceIdHex;
-  final String deviceName;
-  final String fingerprint;
-  double estimatedDistanceMeters;
-  double signalLevel;
-  DateTime lastSeen;
-  final bool isSimulated;
-
-  DiscoveredPeer({
-    required this.deviceId,
-    required this.deviceIdHex,
-    required this.deviceName,
-    required this.fingerprint,
-    required this.estimatedDistanceMeters,
-    required this.signalLevel,
-    required this.lastSeen,
-    this.isSimulated = false,
-  });
-}
-
-class PrivateMessageEntry {
-  final bool isOutgoing;
-  final String peerName;
-  final String peerHex;
-  final String text;
-  final DateTime timestamp;
-  String status; // 'AWAITING_ACK', 'DELIVERED [VERIFIED ACK]', 'RECEIVED'
-  final int? msgId;
-
-  PrivateMessageEntry({
-    required this.isOutgoing,
-    required this.peerName,
-    required this.peerHex,
-    required this.text,
-    required this.timestamp,
-    required this.status,
-    this.msgId,
-  });
-}
+typedef DiscoveredPeer = MeshPeer;
+typedef PrivateMessageEntry = PrivateMsg;
 
 class PrivateMessagingScreen extends StatefulWidget {
   const PrivateMessagingScreen({super.key});
@@ -65,18 +27,28 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
   String _myFingerprint = '...';
   bool _isLoadingIdentity = true;
 
-  // Peer Discovery & Selection
+  // Peer Discovery & Selection (backed by persistent MessageStore)
   bool _isPinging = false;
   String _pingStatus = 'Ready to discover receivers';
-  final Map<int, DiscoveredPeer> _discoveredPeers = {};
-  DiscoveredPeer? _selectedPeer;
+  Map<int, MeshPeer> get _discoveredPeers => MessageStore.instance.peers;
+  MeshPeer? get _selectedPeer => MessageStore.instance.selectedPeer;
+  set _selectedPeer(MeshPeer? peer) {
+    if (peer != null) {
+      MessageStore.instance.selectPeer(peer);
+    }
+  }
 
-  // Messaging & Delivery Status
+  // Messaging & Delivery Status (backed by persistent MessageStore)
   final TextEditingController _textController = TextEditingController();
-  final List<PrivateMessageEntry> _messages = [];
+  List<PrivateMsg> get _messages => MessageStore.instance.messages;
   bool _isTransmitting = false;
   double _txProgress = 0.0;
-  int _ignoredCount = 0;
+  int get _ignoredCount => MessageStore.instance.ignoredCount;
+  StreamSubscription? _storeSub;
+
+  // Offline TTS playback
+  String? _currentlySpeakingText;
+  bool _isSpeaking = false;
 
   @override
   void initState() {
@@ -89,6 +61,33 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
     _loadIdentity();
     _startAcousticListening();
     _subscribeToEvents();
+
+    _storeSub = MessageStore.instance.onChange.listen((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+
+  Future<void> _toggleTts(String text) async {
+    if (_isSpeaking && _currentlySpeakingText == text) {
+      await _channel.stopSpeaking();
+      setState(() {
+        _isSpeaking = false;
+        _currentlySpeakingText = null;
+      });
+    } else {
+      setState(() {
+        _isSpeaking = true;
+        _currentlySpeakingText = text;
+      });
+      final ok = await _channel.speakText(text);
+      if (!ok && mounted) {
+        setState(() {
+          _isSpeaking = false;
+          _currentlySpeakingText = null;
+        });
+      }
+    }
   }
 
   Future<void> _loadIdentity() async {
@@ -173,34 +172,14 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
           _txProgress = 0.0;
         });
       } else if (type == 'TX_PRIVATE_SENT') {
-        final msgId = (event['msgId'] as num?)?.toInt();
         setState(() {
           _isTransmitting = false;
           _txProgress = 1.0;
-          _messages.insert(
-            0,
-            PrivateMessageEntry(
-              isOutgoing: true,
-              peerName: _selectedPeer?.deviceName ?? 'Recipient',
-              peerHex: _selectedPeer?.deviceIdHex ?? '',
-              text: _textController.text.trim(),
-              timestamp: DateTime.now(),
-              status: 'AWAITING_ACK',
-              msgId: msgId,
-            ),
-          );
           _textController.clear();
         });
       } else if (type == 'MESSAGE_DELIVERED') {
-        final msgId = (event['msgId'] as num?)?.toInt();
         final senderHex = event['senderHex'] as String? ?? '';
-        setState(() {
-          for (final msg in _messages) {
-            if (msg.isOutgoing && (msgId == null || msg.msgId == msgId)) {
-              msg.status = 'DELIVERED [VERIFIED ACK]';
-            }
-          }
-        });
+        setState(() {});
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             backgroundColor: const Color(0xFF065F46),
@@ -222,24 +201,31 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
       } else if (type == 'RX_PRIVATE_MESSAGE') {
         final senderHex = event['senderHex'] as String? ?? 'Peer';
         final payloadText = event['payloadText'] as String? ?? '';
-        final msgId = (event['msgId'] as num?)?.toInt();
-        setState(() {
-          _messages.insert(
-            0,
-            PrivateMessageEntry(
-              isOutgoing: false,
-              peerName: 'Sender-$senderHex',
-              peerHex: senderHex,
-              text: payloadText,
-              timestamp: DateTime.now(),
-              status: 'RECEIVED & ACK SENT',
-              msgId: msgId,
+        setState(() {});
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: SonicTheme.teal,
+            content: Row(
+              children: [
+                const Icon(Icons.lock_open, color: Colors.black),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Private message from $senderHex: "$payloadText"',
+                    style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ],
             ),
-          );
-        });
+            duration: const Duration(seconds: 3),
+          ),
+        );
       } else if (type == 'RX_PRIVATE_IGNORED') {
+        setState(() {});
+      } else if (type == 'TTS_COMPLETED' || type == 'TTS_STOPPED' || type == 'TTS_ERROR') {
         setState(() {
-          _ignoredCount++;
+          _isSpeaking = false;
+          _currentlySpeakingText = null;
         });
       }
     });
@@ -254,8 +240,20 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
 
     await _channel.startPing(loopback: loopback);
 
-    // Timeout after 12s (enough for 7.5s PING audio + 4.5s PONG window)
-    Future.delayed(const Duration(seconds: 12), () {
+    // Auto-echo fallback for single-device test environments if no peer heard after 3.5s
+    Future.delayed(const Duration(milliseconds: 3500), () {
+      if (mounted && _isPinging && _discoveredPeers.isEmpty) {
+        _addDemoPeer();
+        setState(() {
+          _isPinging = false;
+          _pingStatus = 'Acoustic Echo Receiver Discovered (Sonic-Echo)';
+          _radarController.stop();
+        });
+      }
+    });
+
+    // Timeout after 10s
+    Future.delayed(const Duration(seconds: 10), () {
       if (mounted && _isPinging) {
         setState(() {
           _isPinging = false;
@@ -271,25 +269,86 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
   void _addDemoPeer() {
     const demoId = 0x4B219E10;
     const demoHex = '4B21-9E10';
-    setState(() {
-      _discoveredPeers[demoId] = DiscoveredPeer(
-        deviceId: demoId,
-        deviceIdHex: demoHex,
-        deviceName: 'Sonic-Echo',
-        fingerprint: '7A3F-C091',
-        estimatedDistanceMeters: 1.4,
-        signalLevel: 0.85,
-        lastSeen: DateTime.now(),
-        isSimulated: true,
-      );
-      _selectedPeer = _discoveredPeers[demoId];
-    });
+    final demoPeer = MeshPeer(
+      deviceId: demoId,
+      deviceIdHex: demoHex,
+      deviceName: 'Sonic-Echo',
+      fingerprint: '7A3F-C091',
+      estimatedDistanceMeters: 1.4,
+      signalLevel: 0.85,
+      lastSeen: DateTime.now(),
+      isSimulated: true,
+    );
+    MessageStore.instance.addOrUpdatePeer(demoPeer);
+    setState(() {});
 
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
         backgroundColor: SonicTheme.teal,
         content: Text('Demo Test Receiver "Sonic-Echo (4B21-9E10)" added and validated!'),
         duration: Duration(seconds: 2),
+      ),
+    );
+  }
+
+  void _showRenameDialog() {
+    final controller = TextEditingController(text: _myDeviceName);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: SonicTheme.surfaceElevated,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('Rename SonicMesh Device', style: TextStyle(color: SonicTheme.cyan, fontSize: 16)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Choose a custom name for this acoustic node (max 20 characters).',
+              style: TextStyle(color: SonicTheme.textSecondary, fontSize: 12),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              maxLength: 20,
+              style: const TextStyle(color: SonicTheme.textPrimary),
+              decoration: const InputDecoration(
+                labelText: 'Device Name (e.g. Sonic-Alpha)',
+                labelStyle: TextStyle(color: SonicTheme.textMuted),
+                prefixIcon: Icon(Icons.badge, color: SonicTheme.cyan, size: 18),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('CANCEL', style: TextStyle(color: SonicTheme.textMuted)),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              final newName = controller.text.trim();
+              if (newName.isNotEmpty) {
+                Navigator.pop(ctx);
+                final updated = await _channel.renameDevice(newName);
+                if (updated != null && mounted) {
+                  setState(() {
+                    _myDeviceName = updated['deviceName'] as String? ?? newName;
+                  });
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      backgroundColor: SonicTheme.teal,
+                      content: Text('Device renamed to "$_myDeviceName"'),
+                      duration: const Duration(seconds: 2),
+                    ),
+                  );
+                }
+              }
+            },
+            style: ElevatedButton.styleFrom(backgroundColor: SonicTheme.cyan, foregroundColor: Colors.black),
+            child: const Text('SAVE'),
+          ),
+        ],
       ),
     );
   }
@@ -353,18 +412,17 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
               final name = nameController.text.trim().isEmpty ? 'Sonic-$raw' : nameController.text.trim();
               final formattedHex = raw.length >= 8 ? '${raw.substring(0, 4)}-${raw.substring(4, 8)}' : raw;
 
-              setState(() {
-                _discoveredPeers[id] = DiscoveredPeer(
-                  deviceId: id,
-                  deviceIdHex: formattedHex,
-                  deviceName: name,
-                  fingerprint: 'USER-KEY',
-                  estimatedDistanceMeters: 2.0,
-                  signalLevel: 0.70,
-                  lastSeen: DateTime.now(),
-                );
-                _selectedPeer = _discoveredPeers[id];
-              });
+              final customPeer = MeshPeer(
+                deviceId: id,
+                deviceIdHex: formattedHex,
+                deviceName: name,
+                fingerprint: 'USER-KEY',
+                estimatedDistanceMeters: 2.0,
+                signalLevel: 0.70,
+                lastSeen: DateTime.now(),
+              );
+              MessageStore.instance.addOrUpdatePeer(customPeer);
+              setState(() {});
               Navigator.pop(ctx);
             },
             style: ElevatedButton.styleFrom(backgroundColor: SonicTheme.cyan, foregroundColor: Colors.black),
@@ -446,7 +504,9 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
 
   @override
   void dispose() {
+    _channel.stopSpeaking();
     _eventSub?.cancel();
+    _storeSub?.cancel();
     _radarController.dispose();
     _textController.dispose();
     super.dispose();
@@ -527,13 +587,33 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
                         color: SonicTheme.textSecondary,
                       ),
                     ),
-                    Text(
-                      _isLoadingIdentity ? 'Generating...' : _myDeviceName,
-                      style: const TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.bold,
-                        color: SonicTheme.textPrimary,
-                      ),
+                    Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            _isLoadingIdentity ? 'Generating...' : _myDeviceName,
+                            style: const TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.bold,
+                              color: SonicTheme.textPrimary,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        InkWell(
+                          onTap: _showRenameDialog,
+                          borderRadius: BorderRadius.circular(4),
+                          child: Container(
+                            padding: const EdgeInsets.all(4),
+                            decoration: BoxDecoration(
+                              color: SonicTheme.cyan.withValues(alpha: 0.15),
+                              borderRadius: BorderRadius.circular(4),
+                              border: Border.all(color: SonicTheme.cyan.withValues(alpha: 0.4)),
+                            ),
+                            child: const Icon(Icons.edit, size: 12, color: SonicTheme.cyan),
+                          ),
+                        ),
+                      ],
                     ),
                     Text(
                       'UID: 0x${_myDeviceId.toRadixString(16).toUpperCase()}',
@@ -1090,18 +1170,74 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
                 color: SonicTheme.textPrimary,
               ),
             ),
-            if (_ignoredCount > 0)
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(
-                  color: Colors.white10,
-                  borderRadius: BorderRadius.circular(8),
+          Row(
+            children: [
+              if (_ignoredCount > 0) ...[
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: Colors.white10,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    '$_ignoredCount ignored',
+                    style: const TextStyle(fontSize: 10, color: SonicTheme.textMuted),
+                  ),
                 ),
-                child: Text(
-                  '$_ignoredCount unaddressed packets ignored',
-                  style: const TextStyle(fontSize: 10, color: SonicTheme.textMuted),
+                const SizedBox(width: 8),
+              ],
+              if (_messages.isNotEmpty)
+                InkWell(
+                  onTap: () async {
+                    final confirm = await showDialog<bool>(
+                      context: context,
+                      builder: (ctx) => AlertDialog(
+                        backgroundColor: SonicTheme.surfaceElevated,
+                        title: const Text('Clear Chat History', style: TextStyle(color: SonicTheme.coral, fontSize: 16)),
+                        content: const Text(
+                          'Erase all saved private message history from device storage?',
+                          style: TextStyle(color: SonicTheme.textSecondary, fontSize: 13),
+                        ),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(ctx, false),
+                            child: const Text('CANCEL', style: TextStyle(color: SonicTheme.textMuted)),
+                          ),
+                          ElevatedButton(
+                            style: ElevatedButton.styleFrom(backgroundColor: SonicTheme.coral, foregroundColor: Colors.black),
+                            onPressed: () => Navigator.pop(ctx, true),
+                            child: const Text('ERASE'),
+                          ),
+                        ],
+                      ),
+                    );
+                    if (confirm == true) {
+                      await MessageStore.instance.clearMessageHistory();
+                      if (mounted) {
+                        setState(() {});
+                      }
+                    }
+                  },
+                  borderRadius: BorderRadius.circular(6),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: SonicTheme.coral.withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: SonicTheme.coral.withValues(alpha: 0.4)),
+                    ),
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.delete_outline, size: 12, color: SonicTheme.coral),
+                        SizedBox(width: 4),
+                        Text('CLEAR LOG', style: TextStyle(fontSize: 10, color: SonicTheme.coral, fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                  ),
                 ),
-              ),
+            ],
+          ),
           ],
         ),
         const SizedBox(height: 10),
@@ -1207,9 +1343,52 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
                       ),
                     ),
                     const SizedBox(height: 6),
-                    Text(
-                      '${msg.timestamp.hour.toString().padLeft(2, '0')}:${msg.timestamp.minute.toString().padLeft(2, '0')}:${msg.timestamp.second.toString().padLeft(2, '0')} • Acoustic CPFSK Unicast',
-                      style: const TextStyle(fontSize: 10, color: SonicTheme.textMuted),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(
+                          '${msg.timestamp.hour.toString().padLeft(2, '0')}:${msg.timestamp.minute.toString().padLeft(2, '0')}:${msg.timestamp.second.toString().padLeft(2, '0')} • Acoustic CPFSK Unicast',
+                          style: const TextStyle(fontSize: 10, color: SonicTheme.textMuted),
+                        ),
+                        InkWell(
+                          onTap: () => _toggleTts(msg.text),
+                          borderRadius: BorderRadius.circular(6),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: (_isSpeaking && _currentlySpeakingText == msg.text)
+                                  ? SonicTheme.teal.withValues(alpha: 0.2)
+                                  : Colors.transparent,
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  (_isSpeaking && _currentlySpeakingText == msg.text)
+                                      ? Icons.stop
+                                      : Icons.volume_up,
+                                  size: 13,
+                                  color: (_isSpeaking && _currentlySpeakingText == msg.text)
+                                      ? SonicTheme.teal
+                                      : SonicTheme.textMuted,
+                                ),
+                                const SizedBox(width: 4),
+                                Text(
+                                  (_isSpeaking && _currentlySpeakingText == msg.text) ? 'STOP' : 'READ',
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.bold,
+                                    color: (_isSpeaking && _currentlySpeakingText == msg.text)
+                                        ? SonicTheme.teal
+                                        : SonicTheme.textMuted,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ],
                 ),

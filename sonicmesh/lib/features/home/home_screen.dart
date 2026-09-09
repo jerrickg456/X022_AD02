@@ -1,6 +1,9 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import '../../app/theme.dart';
 import '../../app/routes.dart';
+import '../../native/acoustic_channel.dart';
+import '../../services/message_store.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -11,6 +14,9 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateMixin {
   late AnimationController _pulseController;
+  String _deviceName = 'Loading...';
+  String _deviceIdHex = '...';
+  StreamSubscription? _storeSub;
 
   @override
   void initState() {
@@ -19,11 +25,89 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       vsync: this,
       duration: const Duration(seconds: 3),
     )..repeat();
+
+    _loadIdentity();
+    _storeSub = MessageStore.instance.onChange.listen((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  Future<void> _loadIdentity() async {
+    final id = await AcousticChannel.instance.getIdentity();
+    if (mounted) {
+      setState(() {
+        _deviceName = id['deviceName'] as String? ?? 'SonicMesh Node';
+        _deviceIdHex = id['deviceIdHex'] as String? ?? '0000-0000';
+      });
+    }
+  }
+
+  void _showRenameDialog() {
+    final controller = TextEditingController(text: _deviceName);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: SonicTheme.surfaceElevated,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('Rename SonicMesh Device', style: TextStyle(color: SonicTheme.cyan, fontSize: 16)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Customize how your acoustic mesh node appears to peers.',
+              style: TextStyle(color: SonicTheme.textSecondary, fontSize: 12),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              maxLength: 20,
+              style: const TextStyle(color: SonicTheme.textPrimary),
+              decoration: const InputDecoration(
+                labelText: 'Node Name',
+                labelStyle: TextStyle(color: SonicTheme.textMuted),
+                prefixIcon: Icon(Icons.badge, color: SonicTheme.cyan, size: 18),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('CANCEL', style: TextStyle(color: SonicTheme.textMuted)),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              final newName = controller.text.trim();
+              if (newName.isNotEmpty) {
+                Navigator.pop(ctx);
+                final updated = await AcousticChannel.instance.renameDevice(newName);
+                if (updated != null && mounted) {
+                  setState(() {
+                    _deviceName = updated['deviceName'] as String? ?? newName;
+                  });
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      backgroundColor: SonicTheme.teal,
+                      content: Text('Device renamed to "$_deviceName"'),
+                      duration: const Duration(seconds: 2),
+                    ),
+                  );
+                }
+              }
+            },
+            style: ElevatedButton.styleFrom(backgroundColor: SonicTheme.cyan, foregroundColor: Colors.black),
+            child: const Text('SAVE'),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
   void dispose() {
     _pulseController.dispose();
+    _storeSub?.cancel();
     super.dispose();
   }
 
@@ -37,7 +121,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               _buildTopHeader(),
-              const SizedBox(height: 24),
+              const SizedBox(height: 16),
+              _buildDeviceIdentityCard(),
+              const SizedBox(height: 20),
               _buildRadarHero(),
               const SizedBox(height: 24),
               _buildNetworkStatusCard(),
@@ -61,11 +147,27 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               ),
               const SizedBox(height: 14),
               _buildActionCard(
+                title: 'PERSISTENT BROADCAST',
+                subtitle: 'Auto-retransmit on a timer — beacons, SOS & area alerts',
+                icon: Icons.timer,
+                accentColor: SonicTheme.amber,
+                onTap: () => Navigator.pushNamed(context, Routes.persistentBroadcast),
+              ),
+              const SizedBox(height: 14),
+              _buildActionCard(
                 title: 'RECEIVER CONSOLE',
                 subtitle: 'Microphone signal demodulator & real-time packet sniffer',
                 icon: Icons.hearing,
                 accentColor: SonicTheme.teal,
                 onTap: () => Navigator.pushNamed(context, Routes.receiver),
+              ),
+              const SizedBox(height: 14),
+              _buildActionCard(
+                title: 'ACOUSTIC RELAY NODE',
+                subtitle: 'Multi-hop A ➔ B ➔ C: Decode weak signal, verify CRC & re-broadcast fresh signal',
+                icon: Icons.repeat,
+                accentColor: const Color(0xFF00E676),
+                onTap: () => Navigator.pushNamed(context, Routes.relay),
               ),
               const SizedBox(height: 14),
               _buildActionCard(
@@ -79,6 +181,105 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _buildDeviceIdentityCard() {
+    final peerCount = MessageStore.instance.peers.length;
+    final msgCount = MessageStore.instance.messages.length;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: SonicTheme.surfaceElevated,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: SonicTheme.cyan.withValues(alpha: 0.3)),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Expanded(
+            child: Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: SonicTheme.cyan.withValues(alpha: 0.15),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(Icons.perm_identity, color: SonicTheme.cyan, size: 20),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Flexible(
+                            child: Text(
+                              _deviceName,
+                              style: const TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.bold,
+                                color: SonicTheme.textPrimary,
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          InkWell(
+                            onTap: _showRenameDialog,
+                            borderRadius: BorderRadius.circular(4),
+                            child: Container(
+                              padding: const EdgeInsets.all(4),
+                              decoration: BoxDecoration(
+                                color: SonicTheme.cyan.withValues(alpha: 0.15),
+                                borderRadius: BorderRadius.circular(4),
+                                border: Border.all(color: SonicTheme.cyan.withValues(alpha: 0.4)),
+                              ),
+                              child: const Icon(Icons.edit, size: 11, color: SonicTheme.cyan),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        'UID: $_deviceIdHex • $peerCount peers • $msgCount msgs',
+                        style: const TextStyle(
+                          fontFamily: 'monospace',
+                          fontSize: 10,
+                          color: SonicTheme.textMuted,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          InkWell(
+            onTap: _showRenameDialog,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: SonicTheme.cyan.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: SonicTheme.cyan.withValues(alpha: 0.3)),
+              ),
+              child: const Text(
+                'RENAME',
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.bold,
+                  color: SonicTheme.cyan,
+                  letterSpacing: 1.0,
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

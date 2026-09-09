@@ -140,4 +140,147 @@ class AcousticChannel {
       return {};
     }
   }
+
+  Future<Map<String, dynamic>?> renameDevice(String newName) async {
+    try {
+      final res = await _methodChannel.invokeMethod<Map>('renameDevice', {
+        'name': newName,
+      });
+      if (res != null) {
+        return Map<String, dynamic>.from(res);
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<bool> startRelayMode({int guardDelayMs = 500, int repetitions = 1, bool relayPrivate = true}) async {
+    try {
+      final res = await _methodChannel.invokeMethod<bool>('startRelayMode', {
+        'guardDelayMs': guardDelayMs,
+        'repetitions': repetitions,
+        'relayPrivate': relayPrivate,
+      });
+      return res ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> stopRelayMode() async {
+    try {
+      final res = await _methodChannel.invokeMethod<bool>('stopRelayMode');
+      return res ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<Map<String, dynamic>> getRelayStats() async {
+    try {
+      final res = await _methodChannel.invokeMethod<Map>('getRelayStats');
+      return Map<String, dynamic>.from(res ?? {});
+    } catch (_) {
+      return {};
+    }
+  }
+
+  Future<Map<String, dynamic>> testRelayPipeline([String message = 'Relay Node B Test Signal']) async {
+    try {
+      final res = await _methodChannel.invokeMethod<Map>('testRelayPipeline', {
+        'message': message,
+      });
+      return Map<String, dynamic>.from(res ?? {});
+    } catch (e) {
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  // Offline Speech-to-Text (STT)
+  Future<bool> startSpeechRecognition() async {
+    try {
+      final res = await _methodChannel.invokeMethod<bool>('startSpeechRecognition');
+      return res ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> stopSpeechRecognition() async {
+    try {
+      final res = await _methodChannel.invokeMethod<bool>('stopSpeechRecognition');
+      return res ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Offline Text-to-Speech (TTS)
+  Future<bool> speakText(String text) async {
+    try {
+      final res = await _methodChannel.invokeMethod<bool>('ttsSpeak', {'text': text});
+      return res ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> stopSpeaking() async {
+    try {
+      final res = await _methodChannel.invokeMethod<bool>('ttsStop');
+      return res ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> pauseSpeaking() async {
+    try {
+      final res = await _methodChannel.invokeMethod<bool>('ttsPause');
+      return res ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Offline Acoustic Image Transfer
+  Future<Map<String, dynamic>?> pickImage({bool isThumbnail = true}) async {
+    try {
+      final res = await _methodChannel.invokeMethod<Map>('pickImage', {
+        'isThumbnail': isThumbnail,
+      });
+      if (res != null) {
+        return Map<String, dynamic>.from(res);
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<Map<String, dynamic>?> prepareImageFromBytes(Uint8List bytes, {bool isThumbnail = true}) async {
+    try {
+      final res = await _methodChannel.invokeMethod<Map>('prepareImageFromBytes', {
+        'bytes': bytes,
+        'isThumbnail': isThumbnail,
+      });
+      if (res != null) {
+        return Map<String, dynamic>.from(res);
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<bool> transmitImage() async {
+    try {
+      final res = await _methodChannel.invokeMethod<bool>('transmitImage');
+      return res ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
 }
+

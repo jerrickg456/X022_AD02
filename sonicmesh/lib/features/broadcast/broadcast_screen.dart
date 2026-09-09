@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import '../../app/theme.dart';
 import '../../native/acoustic_channel.dart';
@@ -24,6 +25,17 @@ class _BroadcastScreenState extends State<BroadcastScreen> with SingleTickerProv
 
   // Relay activity notification
   String? _relayStatus;
+
+  // Offline Voice Input (Speech-to-Text)
+  bool _isVoiceRecording = false;
+  String _sttStatus = '';
+
+  // Offline Acoustic Image Transfer
+  Map<String, dynamic>? _preparedImage;
+  bool _isTransmittingImage = false;
+  double _imageTxProgress = 0.0;
+  int _imageTxCurrentChunk = 0;
+  bool _isThumbnailMode = true; // true = 64x64 thumbnail, false = 128x128 standard
 
   late AnimationController _waveController;
 
@@ -74,9 +86,82 @@ class _BroadcastScreenState extends State<BroadcastScreen> with SingleTickerProv
         setState(() {
           _relayStatus = 'Served autonomous retransmission for chunk #${event['sequence']} (${event['bytes']} B)';
         });
+      } else if (type == 'STT_LISTENING') {
+        setState(() {
+          _isVoiceRecording = true;
+          _sttStatus = 'Listening offline... Speak now';
+        });
+      } else if (type == 'STT_SPEECH_STARTED') {
+        setState(() {
+          _sttStatus = 'Recognizing speech offline...';
+        });
+      } else if (type == 'STT_PARTIAL') {
+        final text = event['text'] as String? ?? '';
+        if (text.isNotEmpty) {
+          setState(() {
+            _textController.text = text;
+            _textController.selection = TextSelection.fromPosition(TextPosition(offset: text.length));
+          });
+        }
+      } else if (type == 'STT_RESULT') {
+        final text = event['text'] as String? ?? '';
+        setState(() {
+          _isVoiceRecording = false;
+          _sttStatus = '';
+          if (text.isNotEmpty) {
+            _textController.text = text;
+            _textController.selection = TextSelection.fromPosition(TextPosition(offset: text.length));
+          }
+        });
+        if (text.isNotEmpty) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              backgroundColor: SonicTheme.teal,
+              content: Text('Voice transcribed offline: "$text"'),
+              duration: const Duration(seconds: 2),
+            ),
+          );
+        }
+      } else if (type == 'STT_SPEECH_ENDED') {
+        setState(() {
+          _sttStatus = 'Processing speech...';
+        });
+      } else if (type == 'STT_ERROR') {
+        setState(() {
+          _isVoiceRecording = false;
+          _sttStatus = '';
+        });
+        final err = event['error'] as String? ?? 'Offline speech recognition error';
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: SonicTheme.coral,
+            content: Text(err),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      } else if (type == 'IMAGE_TX_PROGRESS') {
+        setState(() {
+          _isTransmittingImage = true;
+          _imageTxProgress = (event['progress'] as num?)?.toDouble() ?? 0.0;
+          _imageTxCurrentChunk = (event['chunkIndex'] as num?)?.toInt() ?? 0;
+        });
+      } else if (type == 'IMAGE_TX_COMPLETED') {
+        setState(() {
+          _isTransmittingImage = false;
+          _imageTxProgress = 1.0;
+          _statusText = 'Image #${event['imageId']} acoustic broadcast completed!';
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            backgroundColor: SonicTheme.teal,
+            content: Text('Acoustic Image transmission complete!'),
+            duration: Duration(seconds: 3),
+          ),
+        );
       } else if (type == 'ERROR') {
         setState(() {
           _isTransmitting = false;
+          _isTransmittingImage = false;
           _statusText = 'Error: ${event['message']}';
         });
       }
@@ -89,6 +174,91 @@ class _BroadcastScreenState extends State<BroadcastScreen> with SingleTickerProv
     _eventSubscription?.cancel();
     _textController.dispose();
     super.dispose();
+  }
+
+  Future<void> _toggleVoiceRecording() async {
+    if (_isVoiceRecording) {
+      await AcousticChannel.instance.stopSpeechRecognition();
+      setState(() {
+        _isVoiceRecording = false;
+        _sttStatus = '';
+      });
+    } else {
+      final hasPerm = await AcousticChannel.instance.hasAudioPermission();
+      if (!hasPerm) {
+        final granted = await AcousticChannel.instance.requestAudioPermission();
+        if (!granted) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Microphone permission required for voice recording')),
+            );
+          }
+          return;
+        }
+      }
+      setState(() {
+        _isVoiceRecording = true;
+        _sttStatus = 'Initializing offline speech engine...';
+      });
+      final ok = await AcousticChannel.instance.startSpeechRecognition();
+      if (!ok && mounted) {
+        setState(() {
+          _isVoiceRecording = false;
+          _sttStatus = '';
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Offline speech recognizer not available on this device')),
+        );
+      }
+    }
+  }
+
+  Future<void> _pickImage(bool isThumbnail) async {
+    try {
+      final res = await AcousticChannel.instance.pickImage(isThumbnail: isThumbnail);
+      if (!mounted) return;
+      if (res != null) {
+        setState(() {
+          _preparedImage = res;
+          _isThumbnailMode = isThumbnail;
+          _imageTxProgress = 0.0;
+          _imageTxCurrentChunk = 0;
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error selecting image: $e')),
+      );
+    }
+  }
+
+  Future<void> _transmitPreparedImage() async {
+    if (_preparedImage == null) return;
+    setState(() {
+      _isTransmittingImage = true;
+      _imageTxProgress = 0.0;
+      _imageTxCurrentChunk = 0;
+      _statusText = 'Synthesizing FSK tones for image chunks...';
+    });
+    final ok = await AcousticChannel.instance.transmitImage();
+    if (!ok && mounted) {
+      setState(() {
+        _isTransmittingImage = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Failed to transmit image')),
+      );
+    }
+  }
+
+  void _discardPreparedImage() {
+    setState(() {
+      _preparedImage = null;
+      _isTransmittingImage = false;
+      _imageTxProgress = 0.0;
+      _imageTxCurrentChunk = 0;
+    });
   }
 
   Future<void> _startBroadcast() async {
@@ -113,6 +283,7 @@ class _BroadcastScreenState extends State<BroadcastScreen> with SingleTickerProv
     await AcousticChannel.instance.stopBroadcast();
     setState(() {
       _isTransmitting = false;
+      _isTransmittingImage = false;
       _progress = 0.0;
       _statusText = 'Broadcast aborted';
     });
@@ -140,6 +311,8 @@ class _BroadcastScreenState extends State<BroadcastScreen> with SingleTickerProv
               ],
               const SizedBox(height: 18),
               _buildMessageInputCard(byteCount, estimatedDurationSec),
+              const SizedBox(height: 16),
+              _buildImageTransferCard(),
               const SizedBox(height: 16),
               _buildRedundancySelector(),
               const SizedBox(height: 16),
@@ -262,7 +435,10 @@ class _BroadcastScreenState extends State<BroadcastScreen> with SingleTickerProv
       decoration: BoxDecoration(
         color: SonicTheme.surface,
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: SonicTheme.border),
+        border: Border.all(
+          color: _isVoiceRecording ? SonicTheme.coral : SonicTheme.border,
+          width: _isVoiceRecording ? 1.5 : 1.0,
+        ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -270,17 +446,58 @@ class _BroadcastScreenState extends State<BroadcastScreen> with SingleTickerProv
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text(
-                'PAYLOAD MESSAGE',
-                style: TextStyle(
-                  fontSize: 11,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: 1.0,
-                  color: SonicTheme.textMuted,
+              Expanded(
+                child: Row(
+                  children: [
+                    const Text(
+                      'PAYLOAD MESSAGE',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 1.0,
+                        color: SonicTheme.textMuted,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    InkWell(
+                      onTap: _toggleVoiceRecording,
+                      borderRadius: BorderRadius.circular(12),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                        decoration: BoxDecoration(
+                          color: (_isVoiceRecording ? SonicTheme.coral : SonicTheme.cyan).withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: (_isVoiceRecording ? SonicTheme.coral : SonicTheme.cyan).withValues(alpha: 0.5),
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              _isVoiceRecording ? Icons.mic : Icons.mic_none,
+                              size: 13,
+                              color: _isVoiceRecording ? SonicTheme.coral : SonicTheme.cyan,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              _isVoiceRecording ? 'REC' : 'VOICE',
+                              style: TextStyle(
+                                fontSize: 10,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 0.5,
+                                color: _isVoiceRecording ? SonicTheme.coral : SonicTheme.cyan,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ),
               Text(
-                '$byteCount Bytes • ~$estimatedDurationSec s',
+                '$byteCount B • ~${estimatedDurationSec}s',
                 style: const TextStyle(
                   fontFamily: 'monospace',
                   fontSize: 11,
@@ -290,6 +507,37 @@ class _BroadcastScreenState extends State<BroadcastScreen> with SingleTickerProv
               ),
             ],
           ),
+          if (_isVoiceRecording || _sttStatus.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: SonicTheme.coral.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: SonicTheme.coral.withValues(alpha: 0.3)),
+              ),
+              child: Row(
+                children: [
+                  const SizedBox(
+                    width: 10,
+                    height: 10,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: SonicTheme.coral),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _sttStatus.isNotEmpty ? _sttStatus : 'Listening offline... Speak now to transcribe into input',
+                      style: const TextStyle(fontSize: 11, color: SonicTheme.coral, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  InkWell(
+                    onTap: _toggleVoiceRecording,
+                    child: const Text('STOP', style: TextStyle(fontSize: 10, color: SonicTheme.coral, fontWeight: FontWeight.w900)),
+                  ),
+                ],
+              ),
+            ),
+          ],
           const SizedBox(height: 12),
           TextField(
             controller: _textController,
@@ -300,12 +548,268 @@ class _BroadcastScreenState extends State<BroadcastScreen> with SingleTickerProv
               color: SonicTheme.textPrimary,
               fontWeight: FontWeight.w600,
             ),
-            decoration: const InputDecoration(
-              hintText: 'Enter text to broadcast...',
-              counterStyle: TextStyle(color: SonicTheme.textMuted),
+            decoration: InputDecoration(
+              hintText: 'Enter text to broadcast or tap MIC for offline speech...',
+              counterStyle: const TextStyle(color: SonicTheme.textMuted),
+              suffixIcon: IconButton(
+                icon: Icon(
+                  _isVoiceRecording ? Icons.mic : Icons.mic_none,
+                  color: _isVoiceRecording ? SonicTheme.coral : SonicTheme.cyan,
+                ),
+                tooltip: _isVoiceRecording ? 'Stop Offline Speech Input' : 'Offline Voice Input (Speech-to-Text)',
+                onPressed: _toggleVoiceRecording,
+              ),
             ),
             onChanged: (_) => setState(() {}),
           ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildImageTransferCard() {
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: SonicTheme.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: _isTransmittingImage ? SonicTheme.cyan : SonicTheme.border,
+          width: _isTransmittingImage ? 1.5 : 1.0,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Row(
+                  children: const [
+                    Icon(Icons.image_outlined, size: 16, color: SonicTheme.cyan),
+                    SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        'ACOUSTIC IMAGE TRANSFER',
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 0.8,
+                          color: SonicTheme.textMuted,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 6),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: SonicTheme.teal.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: const Text(
+                  'WEBP CPFSK',
+                  style: TextStyle(fontSize: 9, fontWeight: FontWeight.w800, color: SonicTheme.teal),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+
+          // Thumbnail vs Standard mode selector
+          Row(
+            children: [
+              Expanded(
+                child: InkWell(
+                  onTap: _isTransmittingImage ? null : () => setState(() => _isThumbnailMode = true),
+                  borderRadius: BorderRadius.circular(8),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    decoration: BoxDecoration(
+                      color: _isThumbnailMode ? SonicTheme.cyan.withValues(alpha: 0.15) : SonicTheme.surfaceElevated,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: _isThumbnailMode ? SonicTheme.cyan : SonicTheme.border,
+                      ),
+                    ),
+                    child: Center(
+                      child: Text(
+                        'Thumbnail (64×64)',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: _isThumbnailMode ? FontWeight.w800 : FontWeight.w500,
+                          color: _isThumbnailMode ? SonicTheme.cyan : SonicTheme.textSecondary,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: InkWell(
+                  onTap: _isTransmittingImage ? null : () => setState(() => _isThumbnailMode = false),
+                  borderRadius: BorderRadius.circular(8),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    decoration: BoxDecoration(
+                      color: !_isThumbnailMode ? SonicTheme.cyan.withValues(alpha: 0.15) : SonicTheme.surfaceElevated,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: !_isThumbnailMode ? SonicTheme.cyan : SonicTheme.border,
+                      ),
+                    ),
+                    child: Center(
+                      child: Text(
+                        'Standard (128×128)',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: !_isThumbnailMode ? FontWeight.w800 : FontWeight.w500,
+                          color: !_isThumbnailMode ? SonicTheme.cyan : SonicTheme.textSecondary,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+
+          if (_preparedImage == null) ...[
+            SizedBox(
+              width: double.infinity,
+              height: 44,
+              child: OutlinedButton.icon(
+                onPressed: _isTransmittingImage ? null : () => _pickImage(_isThumbnailMode),
+                icon: const Icon(Icons.add_photo_alternate_outlined, size: 18),
+                label: const Text(
+                  'SELECT IMAGE FROM STORAGE',
+                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 0.5),
+                ),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: SonicTheme.cyan,
+                  side: const BorderSide(color: SonicTheme.cyan),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+              ),
+            ),
+          ] else ...[
+            // Prepared Image Preview & Transmission details
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: SonicTheme.surfaceElevated,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: SonicTheme.cyan.withValues(alpha: 0.3)),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: _preparedImage!['webpBytes'] != null
+                        ? Image.memory(
+                            _preparedImage!['webpBytes'] as Uint8List,
+                            width: 64,
+                            height: 64,
+                            fit: BoxFit.cover,
+                          )
+                        : Container(width: 64, height: 64, color: Colors.black26),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(
+                              '${_preparedImage!['width']}×${_preparedImage!['height']} WebP',
+                              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: SonicTheme.textPrimary),
+                            ),
+                            Text(
+                              '${_preparedImage!['fileSize']} B',
+                              style: const TextStyle(fontFamily: 'monospace', fontSize: 11, color: SonicTheme.teal, fontWeight: FontWeight.bold),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          '${_preparedImage!['totalChunks']} Chunks • 48 B/chunk',
+                          style: const TextStyle(fontSize: 11, color: SonicTheme.textSecondary),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          'Est. Acoustic Duration: ~${_preparedImage!['estimatedDurationSec']}s',
+                          style: const TextStyle(fontSize: 11, color: SonicTheme.cyan, fontWeight: FontWeight.w600),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 10),
+
+            if (_isTransmittingImage) ...[
+              ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: LinearProgressIndicator(
+                  value: _imageTxProgress,
+                  backgroundColor: SonicTheme.surfaceElevated,
+                  color: SonicTheme.cyan,
+                  minHeight: 6,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    'Transmitting Chunk $_imageTxCurrentChunk/${_preparedImage!['totalChunks']}',
+                    style: const TextStyle(fontSize: 10, color: SonicTheme.cyan, fontWeight: FontWeight.bold),
+                  ),
+                  Text(
+                    '${(_imageTxProgress * 100).toInt()}%',
+                    style: const TextStyle(fontFamily: 'monospace', fontSize: 10, color: SonicTheme.cyan),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+            ],
+
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: _isTransmittingImage ? null : _transmitPreparedImage,
+                    icon: _isTransmittingImage
+                        ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black))
+                        : const Icon(Icons.send, size: 16),
+                    label: Text(_isTransmittingImage ? 'TRANSMITTING...' : 'TRANSMIT ACOUSTIC IMAGE'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: SonicTheme.cyan,
+                      foregroundColor: Colors.black,
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      textStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  icon: const Icon(Icons.delete_outline, color: SonicTheme.coral),
+                  tooltip: 'Discard image',
+                  onPressed: _isTransmittingImage ? null : _discardPreparedImage,
+                ),
+              ],
+            ),
+          ],
         ],
       ),
     );

@@ -5,6 +5,7 @@ import kotlinx.coroutines.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.random.Random
 
 class AcousticEngine(
@@ -36,6 +37,7 @@ class AcousticEngine(
     private val signalDetector = SignalDetector(config)
     private val audioPlayer = AudioPlayer(config)
     private val audioCapture = AudioCapture(config)
+    val imageTransferManager: ImageTransferManager? = context?.let { ImageTransferManager(it, onEvent) }
 
     // Rolling ring buffer for incoming audio stream (30 seconds buffer, ~2.6MB)
     private val ringBufferSize = config.sampleRate * 30
@@ -63,6 +65,46 @@ class AcousticEngine(
 
     private var activeSession: FragmentSession? = null
     private val broadcastCache = mutableListOf<AcousticPacket>() // Last transmitted packets for auto-relay
+
+    // Acoustic Relay Mode & Deduplication state
+    var isRelayMode: Boolean = false
+        private set
+    var relayGuardDelayMs: Long = 500L
+    var relayRepetitions: Int = 1
+    var relayPrivateEnabled: Boolean = true
+
+    data class RelayStats(
+        var packetsCaptured: Int = 0,
+        var packetsVerified: Int = 0,
+        var packetsRetransmitted: Int = 0,
+        var duplicatesSuppressed: Int = 0
+    )
+    val relayStats = RelayStats()
+
+    // Signatures of packets recently transmitted or relayed to prevent acoustic feedback/loops
+    private val seenPacketSignatures = ConcurrentHashMap<Long, Long>()
+
+    private fun computePacketSignature(packet: AcousticPacket): Long {
+        val payloadCrc = Crc32.compute(packet.payload)
+        return (packet.type.toLong() and 0xFFL shl 48) or
+               (packet.sequenceNumber.toLong() and 0xFFFFL shl 32) or
+               (payloadCrc and 0xFFFFFFFFL)
+    }
+
+    private fun markSignatureSeen(sig: Long) {
+        val now = System.currentTimeMillis()
+        seenPacketSignatures[sig] = now
+        if (seenPacketSignatures.size > 300) {
+            val cutoff = now - 60_000L
+            seenPacketSignatures.entries.removeIf { it.value < cutoff }
+        }
+    }
+
+    private fun isSignatureRecentlySeen(sig: Long, windowMs: Long = 45_000L): Boolean {
+        val now = System.currentTimeMillis()
+        val lastSeen = seenPacketSignatures[sig] ?: return false
+        return (now - lastSeen) < windowMs
+    }
 
     private var broadcastJob: Job? = null
 
@@ -94,6 +136,10 @@ class AcousticEngine(
                     totalPackets = 1,
                     payload = payload
                 )
+
+                // Track signature so this node never relays its own broadcast
+                val sig = computePacketSignature(packet)
+                markSignatureSeen(sig)
 
                 // Save to local cache so we can autonomously answer NACK / retransmission requests
                 synchronized(broadcastCache) {
@@ -260,6 +306,10 @@ class AcousticEngine(
                     version = config.protocolVersion
                 )
 
+                // Track signature so this node never relays its own private message
+                val sig = computePacketSignature(packet)
+                markSignatureSeen(sig)
+
                 val frame = PacketEncoder.encode(packet, config)
                 val pcm = modulator.modulate(frame)
 
@@ -289,6 +339,7 @@ class AcousticEngine(
                         "senderId" to myIdentity.deviceId,
                         "receiverId" to receiverId,
                         "msgId" to msgId.toInt(),
+                        "message" to message,
                         "status" to "Awaiting Receiver ACK..."
                     )
                 )
@@ -440,6 +491,11 @@ class AcousticEngine(
                             "crcValid" to true
                         )
                     )
+
+                    // If Relay Mode is active, forward the verified message
+                    if (isRelayMode) {
+                        triggerRelay(packet, decodedText)
+                    }
                 } else {
                     // Multi-fragment session
                     var session = activeSession
@@ -552,11 +608,27 @@ class AcousticEngine(
             AcousticPacket.TYPE_PING -> {
                 val pingSenderId = AcousticPacket.parsePing(packet)
                 if (pingSenderId != null && pingSenderId != myIdentity.deviceId) {
+                    val pingSenderHex = String.format("%08X", pingSenderId).let { it.substring(0, 4) + "-" + it.substring(4) }
+                    val pingSenderName = "Sonic-" + String.format("%08X", pingSenderId).substring(0, 4)
+
                     onEvent(
                         mapOf(
                             "type" to "PING_RECEIVED",
                             "senderId" to pingSenderId,
-                            "senderHex" to String.format("%08X", pingSenderId).let { it.substring(0, 4) + "-" + it.substring(4) }
+                            "senderHex" to pingSenderHex
+                        )
+                    )
+
+                    // Autonomously register the transmitter as a discovered peer!
+                    onEvent(
+                        mapOf(
+                            "type" to "PEER_DISCOVERED",
+                            "deviceId" to pingSenderId,
+                            "deviceIdHex" to pingSenderHex,
+                            "deviceName" to pingSenderName,
+                            "fingerprint" to "Acoustic-Ping",
+                            "estimatedDistanceMeters" to lastEstimatedDistance,
+                            "signalLevel" to lastSignalLevel
                         )
                     )
 
@@ -589,30 +661,42 @@ class AcousticEngine(
 
             AcousticPacket.TYPE_PONG -> {
                 val pongData = AcousticPacket.parsePong(packet)
-                if (pongData != null) {
-                    // Only process if addressed to me or general discovery
-                    if (pongData.targetSenderId == myIdentity.deviceId || pongData.targetSenderId == 0) {
-                        onEvent(
-                            mapOf(
-                                "type" to "PEER_DISCOVERED",
-                                "deviceId" to pongData.responderId,
-                                "deviceIdHex" to pongData.responderHex,
-                                "deviceName" to pongData.deviceName,
-                                "fingerprint" to pongData.fingerprintHex,
-                                "estimatedDistanceMeters" to lastEstimatedDistance,
-                                "signalLevel" to lastSignalLevel
-                            )
+                if (pongData != null && pongData.responderId != myIdentity.deviceId) {
+                    onEvent(
+                        mapOf(
+                            "type" to "PEER_DISCOVERED",
+                            "deviceId" to pongData.responderId,
+                            "deviceIdHex" to pongData.responderHex,
+                            "deviceName" to pongData.deviceName,
+                            "fingerprint" to pongData.fingerprintHex,
+                            "estimatedDistanceMeters" to lastEstimatedDistance,
+                            "signalLevel" to lastSignalLevel
                         )
-                    }
+                    )
                 }
             }
 
             AcousticPacket.TYPE_PRIVATE_MESSAGE -> {
                 val msgData = AcousticPacket.parsePrivateMessage(packet)
                 if (msgData != null) {
+                    val senderHex = String.format("%08X", msgData.senderId).let { it.substring(0, 4) + "-" + it.substring(4) }
+                    val senderName = "Sonic-" + String.format("%08X", msgData.senderId).substring(0, 4)
+
+                    // Register sender as a peer
+                    onEvent(
+                        mapOf(
+                            "type" to "PEER_DISCOVERED",
+                            "deviceId" to msgData.senderId,
+                            "deviceIdHex" to senderHex,
+                            "deviceName" to senderName,
+                            "fingerprint" to "Air-Gap",
+                            "estimatedDistanceMeters" to lastEstimatedDistance,
+                            "signalLevel" to lastSignalLevel
+                        )
+                    )
+
                     if (msgData.receiverId == myIdentity.deviceId) {
                         // Targeted to ME! Decrypt and display
-                        val senderHex = String.format("%08X", msgData.senderId).let { it.substring(0, 4) + "-" + it.substring(4) }
                         onEvent(
                             mapOf(
                                 "type" to "RX_PRIVATE_MESSAGE",
@@ -650,7 +734,7 @@ class AcousticEngine(
                             } catch (_: Exception) {}
                         }
                     } else {
-                        // Unicast message addressed to another device: IGNORE
+                        // Unicast message addressed to another device
                         onEvent(
                             mapOf(
                                 "type" to "RX_PRIVATE_IGNORED",
@@ -659,6 +743,11 @@ class AcousticEngine(
                                 "reason" to "Unicast target mismatch (intended for another device)"
                             )
                         )
+
+                        // If relay is active, relay the private message towards target
+                        if (isRelayMode && relayPrivateEnabled) {
+                            triggerRelay(packet, "[Private to ${String.format("%08X", msgData.receiverId)}]: ${msgData.text}")
+                        }
                     }
                 }
             }
@@ -679,6 +768,39 @@ class AcousticEngine(
                                 "status" to "DELIVERED [VERIFIED ACK]"
                             )
                         )
+                    } else if (isRelayMode && relayPrivateEnabled) {
+                        // Relay delivery ACK back towards original sender
+                        triggerRelay(packet, "[ACK for ${String.format("%08X", ackData.receiverId)}]")
+                    }
+                }
+            }
+
+            AcousticPacket.TYPE_IMAGE_START -> {
+                val startData = AcousticPacket.parseImageStart(packet)
+                if (startData != null) {
+                    imageTransferManager?.handleImageStart(startData)
+                    if (isRelayMode) {
+                        triggerRelay(packet, "[Image #${startData.imageId} Start: ${startData.width}x${startData.height}]")
+                    }
+                }
+            }
+
+            AcousticPacket.TYPE_IMAGE_CHUNK -> {
+                val chunkData = AcousticPacket.parseImageChunk(packet)
+                if (chunkData != null) {
+                    imageTransferManager?.handleImageChunk(chunkData)
+                    if (isRelayMode) {
+                        triggerRelay(packet, "[Image #${chunkData.imageId} Chunk ${chunkData.chunkIndex}/${chunkData.totalChunks}]")
+                    }
+                }
+            }
+
+            AcousticPacket.TYPE_IMAGE_END -> {
+                val endData = AcousticPacket.parseImageEnd(packet)
+                if (endData != null) {
+                    imageTransferManager?.handleImageEnd(endData)
+                    if (isRelayMode) {
+                        triggerRelay(packet, "[Image #${endData.imageId} End]")
                     }
                 }
             }
@@ -780,5 +902,269 @@ class AcousticEngine(
             "autoRecoveryEnabled" to config.autoRecoveryEnabled,
             "cachedPacketsCount" to broadcastCache.size
         )
+    }
+
+    /**
+     * Acoustic Relay core pipeline:
+     * Receives verified packet -> Checks deduplication cache -> Waits turnaround guard delay
+     * -> Synthesizes fresh CPFSK audio waveform -> Transmits through speaker.
+     */
+    fun triggerRelay(packet: AcousticPacket, decodedSummary: String) {
+        if (!isRelayMode) return
+        relayStats.packetsCaptured++
+        relayStats.packetsVerified++
+
+        val sig = computePacketSignature(packet)
+        if (isSignatureRecentlySeen(sig)) {
+            relayStats.duplicatesSuppressed++
+            onEvent(
+                mapOf(
+                    "type" to "RELAY_DUPLICATE_SUPPRESSED",
+                    "payloadText" to decodedSummary,
+                    "reason" to "Recently seen or locally originated (loop prevented)",
+                    "stats" to getRelayStats()
+                )
+            )
+            return
+        }
+
+        markSignatureSeen(sig)
+
+        onEvent(
+            mapOf(
+                "type" to "RELAY_PACKET_QUEUED",
+                "payloadText" to decodedSummary,
+                "bytes" to packet.payload.size,
+                "guardDelayMs" to relayGuardDelayMs,
+                "signalLevel" to lastSignalLevel,
+                "estimatedDistanceMeters" to lastEstimatedDistance,
+                "stats" to getRelayStats()
+            )
+        )
+
+        scope.launch {
+            try {
+                // Guard pause to allow channel clearance and prevent self-interference
+                delay(relayGuardDelayMs)
+
+                // Wait if another audio burst is playing
+                while (currentState == State.TRANSMITTING) {
+                    delay(100)
+                }
+
+                currentState = State.TRANSMITTING
+
+                // Synthesize fresh CPFSK audio waveform from scratch (NEVER amplify/replay mic audio!)
+                val frame = PacketEncoder.encode(packet, config)
+                val pcm = modulator.modulate(frame, amplitude = 1.0)
+                val durationMs = pcm.size * 1000L / config.sampleRate
+
+                onEvent(
+                    mapOf(
+                        "type" to "RELAY_TX_STARTED",
+                        "payloadText" to decodedSummary,
+                        "bytes" to packet.payload.size,
+                        "durationMs" to durationMs,
+                        "repetitions" to relayRepetitions,
+                        "stats" to getRelayStats()
+                    )
+                )
+
+                for (rep in 1..relayRepetitions) {
+                    audioPlayer.play(pcm) { progress ->
+                        onEvent(
+                            mapOf(
+                                "type" to "RELAY_TX_PROGRESS",
+                                "progress" to progress,
+                                "repetition" to rep
+                            )
+                        )
+                    }
+                    if (rep < relayRepetitions) {
+                        delay(250)
+                    }
+                }
+
+                relayStats.packetsRetransmitted++
+                onEvent(
+                    mapOf(
+                        "type" to "RELAY_TX_COMPLETED",
+                        "payloadText" to decodedSummary,
+                        "stats" to getRelayStats()
+                    )
+                )
+            } catch (e: Exception) {
+                onEvent(
+                    mapOf(
+                        "type" to "ERROR",
+                        "message" to "Relay transmission failed: ${e.message}"
+                    )
+                )
+            } finally {
+                currentState = if (audioCapture.isCapturing) State.LISTENING else State.IDLE
+            }
+        }
+    }
+
+    fun startRelayMode(guardDelayMs: Long = 500L, repetitions: Int = 1, relayPrivate: Boolean = true) {
+        isRelayMode = true
+        relayGuardDelayMs = guardDelayMs.coerceIn(200L, 2000L)
+        relayRepetitions = repetitions.coerceIn(1, 3)
+        relayPrivateEnabled = relayPrivate
+        startListening()
+        onEvent(
+            mapOf(
+                "type" to "RELAY_MODE_CHANGED",
+                "isRelayMode" to true,
+                "guardDelayMs" to relayGuardDelayMs,
+                "repetitions" to relayRepetitions,
+                "stats" to getRelayStats()
+            )
+        )
+    }
+
+    fun stopRelayMode() {
+        isRelayMode = false
+        onEvent(
+            mapOf(
+                "type" to "RELAY_MODE_CHANGED",
+                "isRelayMode" to false,
+                "stats" to getRelayStats()
+            )
+        )
+    }
+
+    fun getRelayStats(): Map<String, Any> {
+        return mapOf(
+            "packetsCaptured" to relayStats.packetsCaptured,
+            "packetsVerified" to relayStats.packetsVerified,
+            "packetsRetransmitted" to relayStats.packetsRetransmitted,
+            "duplicatesSuppressed" to relayStats.duplicatesSuppressed,
+            "isRelayMode" to isRelayMode
+        )
+    }
+
+    fun testRelayPipeline(testMessage: String = "Relay Node B Test Signal"): Map<String, Any> {
+        val payload = testMessage.toByteArray(StandardCharsets.UTF_8)
+        val testPacket = AcousticPacket(
+            version = config.protocolVersion,
+            type = AcousticPacket.TYPE_DATA,
+            sequenceNumber = 1,
+            totalPackets = 1,
+            payload = payload
+        )
+
+        val encodedFrame = PacketEncoder.encode(testPacket, config)
+        val decodeResult = PacketDecoder.decode(encodedFrame, config)
+
+        return if (decodeResult is PacketDecoder.Result.Success) {
+            val decodedPacket = decodeResult.packet
+            val decodedText = String(decodedPacket.payload, StandardCharsets.UTF_8)
+            triggerRelay(decodedPacket, decodedText)
+            mapOf(
+                "success" to true,
+                "decodedText" to decodedText,
+                "crcValid" to true,
+                "bytes" to decodedPacket.payload.size
+            )
+        } else {
+            mapOf(
+                "success" to false,
+                "error" to "Test decode verification failed"
+            )
+        }
+    }
+
+    /**
+     * Transmits a prepared image through acoustic CPFSK:
+     * 1. TYPE_IMAGE_START (Dimensions, Size, Chunks)
+     * 2. Sequenced TYPE_IMAGE_CHUNK packets with guard intervals
+     * 3. TYPE_IMAGE_END (Verification checksum)
+     */
+    fun sendImage(prepared: ImageTransferManager.PreparedImage) {
+        if (currentState == State.TRANSMITTING) return
+
+        broadcastJob?.cancel()
+        broadcastJob = scope.launch {
+            try {
+                currentState = State.TRANSMITTING
+
+                onEvent(mapOf(
+                    "type" to "IMAGE_TX_STARTED",
+                    "imageId" to prepared.imageId,
+                    "totalChunks" to prepared.totalChunks,
+                    "fileSize" to prepared.fileSize,
+                    "estimatedDurationSec" to prepared.estimatedDurationSec
+                ))
+
+                // 1. TYPE_IMAGE_START
+                val startPacket = AcousticPacket.createImageStartPacket(
+                    imageId = prepared.imageId,
+                    width = prepared.width.toShort(),
+                    height = prepared.height.toShort(),
+                    fileSize = prepared.fileSize,
+                    format = AcousticPacket.FORMAT_WEBP,
+                    totalChunks = prepared.totalChunks.toShort(),
+                    chunkSize = 48,
+                    version = config.protocolVersion
+                )
+                val startFrame = PacketEncoder.encode(startPacket, config)
+                val startPcm = modulator.modulate(startFrame)
+                audioPlayer.play(startPcm) {}
+                delay(350)
+
+                // 2. Chunks
+                for ((index, chunkBytes) in prepared.chunks.withIndex()) {
+                    val chunkIndex = (index + 1).toShort()
+                    val chunkPacket = AcousticPacket.createImageChunkPacket(
+                        imageId = prepared.imageId,
+                        chunkIndex = chunkIndex,
+                        totalChunks = prepared.totalChunks.toShort(),
+                        chunkData = chunkBytes,
+                        version = config.protocolVersion
+                    )
+                    val chunkFrame = PacketEncoder.encode(chunkPacket, config)
+                    val chunkPcm = modulator.modulate(chunkFrame)
+
+                    audioPlayer.play(chunkPcm) {}
+
+                    val progress = (index + 1).toFloat() / prepared.totalChunks.toFloat()
+                    onEvent(mapOf(
+                        "type" to "IMAGE_TX_PROGRESS",
+                        "imageId" to prepared.imageId,
+                        "chunkIndex" to chunkIndex.toInt(),
+                        "totalChunks" to prepared.totalChunks,
+                        "progress" to progress
+                    ))
+
+                    delay(250) // Inter-packet guard silence
+                }
+
+                // 3. TYPE_IMAGE_END
+                val endPacket = AcousticPacket.createImageEndPacket(
+                    imageId = prepared.imageId,
+                    totalChunks = prepared.totalChunks.toShort(),
+                    imageCrc32 = prepared.imageCrc32,
+                    version = config.protocolVersion
+                )
+                val endFrame = PacketEncoder.encode(endPacket, config)
+                val endPcm = modulator.modulate(endFrame)
+                audioPlayer.play(endPcm) {}
+
+                onEvent(mapOf(
+                    "type" to "IMAGE_TX_COMPLETED",
+                    "imageId" to prepared.imageId,
+                    "totalChunks" to prepared.totalChunks
+                ))
+            } catch (e: Exception) {
+                currentState = State.ERROR
+                onEvent(mapOf(
+                    "type" to "ERROR",
+                    "message" to "Image transmission failed: ${e.message}"
+                ))
+            } finally {
+                currentState = if (audioCapture.isCapturing) State.LISTENING else State.IDLE
+            }
+        }
     }
 }

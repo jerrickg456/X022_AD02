@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../../app/theme.dart';
@@ -12,6 +13,14 @@ class DecodedMessage {
   final bool crcValid;
   final bool wasReassembled;
   final DateTime timestamp;
+  final bool isPrivate;
+  final String? senderHex;
+  final Uint8List? imageBytes;
+  final String? imagePath;
+  final int? imageWidth;
+  final int? imageHeight;
+
+  bool get isImage => imageBytes != null || imagePath != null;
 
   DecodedMessage({
     required this.text,
@@ -21,6 +30,12 @@ class DecodedMessage {
     required this.crcValid,
     this.wasReassembled = false,
     required this.timestamp,
+    this.isPrivate = false,
+    this.senderHex,
+    this.imageBytes,
+    this.imagePath,
+    this.imageWidth,
+    this.imageHeight,
   });
 }
 
@@ -44,6 +59,14 @@ class _ReceiverScreenState extends State<ReceiverScreen> with SingleTickerProvid
   // Incomplete frame tracking & recovery
   Map<String, dynamic>? _incompleteSession;
   bool _isRequestingRetrans = false;
+
+  // Offline TTS playback tracking
+  String? _currentlySpeakingText;
+  bool _isTtsSpeaking = false;
+  bool _isTtsPaused = false;
+
+  // Incoming acoustic image session
+  Map<String, dynamic>? _incomingImageSession;
 
   final List<DecodedMessage> _messages = [];
   late AnimationController _radarController;
@@ -112,6 +135,62 @@ class _ReceiverScreenState extends State<ReceiverScreen> with SingleTickerProvid
             duration: const Duration(seconds: 4),
           ),
         );
+      } else if (type == 'RX_PRIVATE_MESSAGE') {
+        final payloadText = event['payloadText'] as String? ?? '';
+        final senderHex = event['senderHex'] as String? ?? 'Peer';
+
+        HapticFeedback.heavyImpact();
+        setState(() {
+          _messages.insert(
+            0,
+            DecodedMessage(
+              text: payloadText,
+              sequence: 1,
+              total: 1,
+              bytes: payloadText.length,
+              crcValid: true,
+              wasReassembled: false,
+              timestamp: DateTime.now(),
+              isPrivate: true,
+              senderHex: senderHex,
+            ),
+          );
+          _statusMessage = 'Private message received from $senderHex (ACK sent)';
+        });
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: SonicTheme.cyan,
+            content: Row(
+              children: [
+                const Icon(Icons.lock_open, color: Colors.black),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Private Message from $senderHex: "$payloadText"',
+                    style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ],
+            ),
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      } else if (type == 'PEER_DISCOVERED') {
+        final name = event['deviceName'] as String? ?? 'Sonic-Peer';
+        final hex = event['deviceIdHex'] as String? ?? '';
+        setState(() {
+          _statusMessage = 'Acoustic peer active: $name ($hex)';
+        });
+      } else if (type == 'PING_RECEIVED') {
+        final senderHex = event['senderHex'] as String? ?? '';
+        setState(() {
+          _statusMessage = 'Ultrasonic PING received from $senderHex. Sending PONG...';
+        });
+      } else if (type == 'PONG_SENT') {
+        setState(() {
+          _statusMessage = 'Acoustic PONG identity beacon sent';
+        });
       } else if (type == 'RX_INCOMPLETE') {
         setState(() {
           _incompleteSession = event;
@@ -141,6 +220,99 @@ class _ReceiverScreenState extends State<ReceiverScreen> with SingleTickerProvid
           });
           _radarController.stop();
         }
+      } else if (type == 'TTS_STARTED') {
+        setState(() {
+          _isTtsSpeaking = true;
+          _isTtsPaused = false;
+        });
+      } else if (type == 'TTS_COMPLETED') {
+        setState(() {
+          _isTtsSpeaking = false;
+          _isTtsPaused = false;
+          _currentlySpeakingText = null;
+        });
+      } else if (type == 'TTS_STOPPED') {
+        setState(() {
+          _isTtsSpeaking = false;
+          _currentlySpeakingText = null;
+        });
+      } else if (type == 'TTS_ERROR') {
+        setState(() {
+          _isTtsSpeaking = false;
+          _currentlySpeakingText = null;
+        });
+      } else if (type == 'IMAGE_RX_START') {
+        setState(() {
+          _incomingImageSession = {
+            'imageId': event['imageId'],
+            'width': event['width'],
+            'height': event['height'],
+            'fileSize': event['fileSize'],
+            'totalChunks': event['totalChunks'],
+            'receivedChunks': 0,
+            'progress': 0.0,
+          };
+          _statusMessage = 'Receiving acoustic image #${event['imageId']} (${event['totalChunks']} chunks)...';
+        });
+      } else if (type == 'IMAGE_RX_PROGRESS') {
+        setState(() {
+          if (_incomingImageSession != null) {
+            _incomingImageSession!['receivedChunks'] = event['chunkIndex'];
+            _incomingImageSession!['progress'] = (event['progress'] as num?)?.toDouble() ?? 0.0;
+          }
+          _statusMessage = 'Acoustic image chunk ${event['chunkIndex']}/${event['totalChunks']} received';
+        });
+      } else if (type == 'IMAGE_RECEIVED') {
+        HapticFeedback.heavyImpact();
+        final rawBytes = event['bytes'];
+        final bytes = rawBytes is Uint8List
+            ? rawBytes
+            : (rawBytes is List ? Uint8List.fromList(List<int>.from(rawBytes)) : null);
+        final path = event['filePath'] as String?;
+        final id = event['imageId'] ?? 0;
+        final w = (event['width'] as num?)?.toInt() ?? 64;
+        final h = (event['height'] as num?)?.toInt() ?? 64;
+        final sz = (event['fileSize'] as num?)?.toInt() ?? 0;
+        final verified = event['verified'] as bool? ?? true;
+
+        setState(() {
+          _incomingImageSession = null;
+          _messages.insert(
+            0,
+            DecodedMessage(
+              text: 'Acoustic Image #$id (${w}x$h WebP)',
+              sequence: 1,
+              total: 1,
+              bytes: sz,
+              crcValid: verified,
+              timestamp: DateTime.now(),
+              imageBytes: bytes,
+              imagePath: path,
+              imageWidth: w,
+              imageHeight: h,
+            ),
+          );
+          _statusMessage = 'Acoustic Image #$id received & verified ($sz B)';
+        });
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: SonicTheme.teal,
+            content: Row(
+              children: [
+                const Icon(Icons.image, color: Colors.black),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Acoustic Image #$id Received & Verified ($sz B)',
+                    style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ],
+            ),
+            duration: const Duration(seconds: 4),
+          ),
+        );
       } else if (type == 'ERROR') {
         setState(() {
           _statusMessage = 'Error: ${event['message']}';
@@ -151,10 +323,46 @@ class _ReceiverScreenState extends State<ReceiverScreen> with SingleTickerProvid
 
   @override
   void dispose() {
+    AcousticChannel.instance.stopSpeaking();
     AcousticChannel.instance.stopListening();
     _radarController.dispose();
     _eventSubscription?.cancel();
     super.dispose();
+  }
+
+  Future<void> _playTts(String text) async {
+    if (_currentlySpeakingText == text && _isTtsSpeaking) {
+      await AcousticChannel.instance.pauseSpeaking();
+      setState(() {
+        _isTtsSpeaking = false;
+        _isTtsPaused = true;
+      });
+    } else {
+      setState(() {
+        _currentlySpeakingText = text;
+        _isTtsSpeaking = true;
+        _isTtsPaused = false;
+      });
+      final ok = await AcousticChannel.instance.speakText(text);
+      if (!ok && mounted) {
+        setState(() {
+          _isTtsSpeaking = false;
+          _currentlySpeakingText = null;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Offline TTS engine not available')),
+        );
+      }
+    }
+  }
+
+  Future<void> _stopTts() async {
+    await AcousticChannel.instance.stopSpeaking();
+    setState(() {
+      _isTtsSpeaking = false;
+      _isTtsPaused = false;
+      _currentlySpeakingText = null;
+    });
   }
 
   Future<void> _manualRetransmit() async {
@@ -251,6 +459,10 @@ class _ReceiverScreenState extends State<ReceiverScreen> with SingleTickerProvid
                     if (_incompleteSession != null) ...[
                       const SizedBox(height: 14),
                       _buildIncompleteRecoveryCard(),
+                    ],
+                    if (_incomingImageSession != null) ...[
+                      const SizedBox(height: 14),
+                      _buildIncomingImageCard(),
                     ],
                     const SizedBox(height: 20),
                     const Divider(color: SonicTheme.border, height: 1),
@@ -682,6 +894,32 @@ class _ReceiverScreenState extends State<ReceiverScreen> with SingleTickerProvid
             children: [
               Row(
                 children: [
+                  if (msg.isPrivate) ...[
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: SonicTheme.cyan.withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: SonicTheme.cyan.withValues(alpha: 0.5)),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.lock, size: 12, color: SonicTheme.cyan),
+                          const SizedBox(width: 4),
+                          Text(
+                            'PRIVATE (${msg.senderHex ?? "PEER"})',
+                            style: const TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.w800,
+                              color: SonicTheme.cyan,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                  ],
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                     decoration: BoxDecoration(
@@ -743,15 +981,64 @@ class _ReceiverScreenState extends State<ReceiverScreen> with SingleTickerProvid
               ),
             ],
           ),
-          const SizedBox(height: 12),
-          SelectableText(
-            msg.text,
-            style: const TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
-              color: SonicTheme.textPrimary,
+          if (msg.isImage) ...[
+            const SizedBox(height: 12),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(10),
+              child: Container(
+                constraints: const BoxConstraints(maxHeight: 200),
+                width: double.infinity,
+                color: Colors.black38,
+                child: msg.imageBytes != null
+                    ? Image.memory(
+                        msg.imageBytes!,
+                        fit: BoxFit.contain,
+                      )
+                    : (msg.imagePath != null
+                        ? Image.file(
+                            File(msg.imagePath!),
+                            fit: BoxFit.contain,
+                          )
+                        : const SizedBox(
+                            height: 60,
+                            child: Center(
+                              child: Text('Image payload stored', style: TextStyle(color: SonicTheme.textMuted)),
+                            ),
+                          )),
+              ),
             ),
-          ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: SonicTheme.teal.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    '${msg.imageWidth ?? 64}×${msg.imageHeight ?? 64} WebP',
+                    style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: SonicTheme.teal),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                const Text(
+                  'Acoustic CPFSK Reassembled',
+                  style: TextStyle(fontSize: 11, color: SonicTheme.textSecondary),
+                ),
+              ],
+            ),
+          ] else ...[
+            const SizedBox(height: 12),
+            SelectableText(
+              msg.text,
+              style: const TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
+                color: SonicTheme.textPrimary,
+              ),
+            ),
+          ],
           const SizedBox(height: 10),
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -764,29 +1051,189 @@ class _ReceiverScreenState extends State<ReceiverScreen> with SingleTickerProvid
                   color: SonicTheme.textMuted,
                 ),
               ),
-              InkWell(
-                onTap: () {
-                  Clipboard.setData(ClipboardData(text: msg.text));
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Message copied to clipboard')),
-                  );
-                },
-                child: Row(
-                  children: const [
-                    Icon(Icons.copy, size: 14, color: SonicTheme.cyan),
-                    SizedBox(width: 4),
-                    Text(
-                      'COPY',
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.bold,
-                        color: SonicTheme.cyan,
-                      ),
-                    ),
+              Row(
+                children: [
+                  if (!msg.isImage && msg.text.trim().isNotEmpty) ...[
+                    _buildTtsControls(msg.text),
+                    const SizedBox(width: 10),
                   ],
+                  InkWell(
+                    onTap: () {
+                      Clipboard.setData(ClipboardData(text: msg.text));
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Message copied to clipboard')),
+                      );
+                    },
+                    child: Row(
+                      children: const [
+                        Icon(Icons.copy, size: 14, color: SonicTheme.cyan),
+                        SizedBox(width: 4),
+                        Text(
+                          'COPY',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                            color: SonicTheme.cyan,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTtsControls(String text) {
+    final isCurrent = _currentlySpeakingText == text;
+    final isPlaying = isCurrent && _isTtsSpeaking;
+    final isPaused = isCurrent && _isTtsPaused;
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // Play / Pause toggle
+        InkWell(
+          onTap: () => _playTts(text),
+          borderRadius: BorderRadius.circular(6),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+            decoration: BoxDecoration(
+              color: isPlaying ? SonicTheme.teal : SonicTheme.surfaceElevated,
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(
+                color: isPlaying ? SonicTheme.teal : SonicTheme.border,
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  isPlaying
+                      ? Icons.pause
+                      : (isPaused ? Icons.play_arrow : Icons.volume_up),
+                  size: 13,
+                  color: isPlaying ? Colors.black : SonicTheme.teal,
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  isPlaying
+                      ? 'PAUSE'
+                      : (isPaused ? 'RESUME' : 'READ'),
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    color: isPlaying ? Colors.black : SonicTheme.teal,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (isCurrent && (isPlaying || isPaused)) ...[
+          const SizedBox(width: 4),
+          // Stop button
+          InkWell(
+            onTap: _stopTts,
+            borderRadius: BorderRadius.circular(6),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+              decoration: BoxDecoration(
+                color: SonicTheme.coral.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: SonicTheme.coral.withValues(alpha: 0.4)),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.stop, size: 13, color: SonicTheme.coral),
+                  SizedBox(width: 2),
+                  Text(
+                    'STOP',
+                    style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: SonicTheme.coral),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildIncomingImageCard() {
+    final session = _incomingImageSession!;
+    final rcv = session['receivedChunks'] ?? 0;
+    final tot = session['totalChunks'] ?? 1;
+    final prog = (session['progress'] as num?)?.toDouble() ?? 0.0;
+    final id = session['imageId'] ?? 0;
+    final w = session['width'] ?? 64;
+    final h = session['height'] ?? 64;
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: SonicTheme.cyan.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: SonicTheme.cyan.withValues(alpha: 0.5)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(strokeWidth: 2, color: SonicTheme.cyan),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                'RECEIVING ACOUSTIC IMAGE #$id',
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0.8,
+                  color: SonicTheme.cyan,
+                ),
+              ),
+              const Spacer(),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: SonicTheme.cyan.withValues(alpha: 0.2),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  '$rcv/$tot Chunks',
+                  style: const TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    fontFamily: 'monospace',
+                    color: SonicTheme.cyan,
+                  ),
                 ),
               ),
             ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Demodulating $w×$h WebP image over 16.5 kHz / 17.5 kHz CPFSK...',
+            style: const TextStyle(fontSize: 11, color: SonicTheme.textSecondary),
+          ),
+          const SizedBox(height: 10),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: prog,
+              backgroundColor: SonicTheme.surfaceElevated,
+              color: SonicTheme.cyan,
+              minHeight: 6,
+            ),
           ),
         ],
       ),

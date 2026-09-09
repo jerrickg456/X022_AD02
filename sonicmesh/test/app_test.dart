@@ -7,6 +7,7 @@ void main() {
     expect(find.text('SONICMESH'), findsOneWidget);
     expect(find.text('BROADCAST CONSOLE'), findsOneWidget);
     expect(find.text('RECEIVER CONSOLE'), findsOneWidget);
+    expect(find.text('ACOUSTIC RELAY NODE'), findsOneWidget);
     expect(find.text('DSP DIAGNOSTICS'), findsOneWidget);
   });
 }
