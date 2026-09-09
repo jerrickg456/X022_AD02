@@ -109,9 +109,11 @@ class AcousticChannel {
     }
   }
 
-  Future<bool> startPing() async {
+  Future<bool> startPing({bool loopback = false}) async {
     try {
-      final res = await _methodChannel.invokeMethod<bool>('startPing');
+      final res = await _methodChannel.invokeMethod<bool>('startPing', {
+        'loopback': loopback,
+      });
       return res ?? false;
     } catch (_) {
       return false;

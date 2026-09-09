@@ -11,6 +11,7 @@ class DiscoveredPeer {
   double estimatedDistanceMeters;
   double signalLevel;
   DateTime lastSeen;
+  final bool isSimulated;
 
   DiscoveredPeer({
     required this.deviceId,
@@ -20,6 +21,7 @@ class DiscoveredPeer {
     required this.estimatedDistanceMeters,
     required this.signalLevel,
     required this.lastSeen,
+    this.isSimulated = false,
   });
 }
 
@@ -65,6 +67,7 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
 
   // Peer Discovery & Selection
   bool _isPinging = false;
+  String _pingStatus = 'Ready to discover receivers';
   final Map<int, DiscoveredPeer> _discoveredPeers = {};
   DiscoveredPeer? _selectedPeer;
 
@@ -131,17 +134,33 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
             estimatedDistanceMeters: dist,
             signalLevel: sig,
             lastSeen: DateTime.now(),
+            isSimulated: id == 0x4B219E10,
           );
           if (_selectedPeer == null || _selectedPeer!.deviceId == id) {
             _selectedPeer = _discoveredPeers[id];
           }
           _isPinging = false;
+          _pingStatus = 'Discovered $name ($hex)';
           _radarController.stop();
         });
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: const Color(0xFF065F46),
+            content: Text('Acoustic Peer Discovered: $name ($hex)'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
       } else if (type == 'PING_STARTED') {
+        final durationMs = (event['durationMs'] as num?)?.toInt() ?? 7500;
         setState(() {
           _isPinging = true;
+          _pingStatus = 'Broadcasting acoustic PING tone (${(durationMs / 1000).toStringAsFixed(1)}s)...';
           _radarController.repeat();
+        });
+      } else if (type == 'PING_SENT') {
+        setState(() {
+          _pingStatus = 'Awaiting ultrasonic PONG responses from nearby devices...';
         });
       } else if (type == 'TX_PROGRESS') {
         final prog = (event['progress'] as num?)?.toDouble() ?? 0.0;
@@ -158,7 +177,6 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
         setState(() {
           _isTransmitting = false;
           _txProgress = 1.0;
-          // Add to local message history awaiting ACK
           _messages.insert(
             0,
             PrivateMessageEntry(
@@ -190,9 +208,11 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
               children: [
                 const Icon(Icons.verified, color: SonicTheme.teal, size: 20),
                 const SizedBox(width: 8),
-                Text(
-                  'Acoustic ACK received from $senderHex! Message Delivered.',
-                  style: const TextStyle(fontWeight: FontWeight.bold),
+                Expanded(
+                  child: Text(
+                    'Acoustic ACK received from $senderHex! Message Delivered.',
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
                 ),
               ],
             ),
@@ -225,36 +245,198 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
     });
   }
 
-  Future<void> _pingNearbyDevices() async {
+  Future<void> _pingNearbyDevices({bool loopback = false}) async {
     setState(() {
       _isPinging = true;
+      _pingStatus = 'Synthesizing ultrasonic PING packet (16.5 kHz / 17.5 kHz)...';
       _radarController.repeat();
     });
-    await _channel.startPing();
-    // Stop radar after 5s if no response
-    Future.delayed(const Duration(seconds: 5), () {
+
+    await _channel.startPing(loopback: loopback);
+
+    // Timeout after 12s (enough for 7.5s PING audio + 4.5s PONG window)
+    Future.delayed(const Duration(seconds: 12), () {
       if (mounted && _isPinging) {
         setState(() {
           _isPinging = false;
+          _pingStatus = _discoveredPeers.isEmpty
+              ? 'PING completed. No external receivers detected.'
+              : 'Discovery complete (${_discoveredPeers.length} peers found).';
           _radarController.stop();
         });
       }
     });
   }
 
+  void _addDemoPeer() {
+    const demoId = 0x4B219E10;
+    const demoHex = '4B21-9E10';
+    setState(() {
+      _discoveredPeers[demoId] = DiscoveredPeer(
+        deviceId: demoId,
+        deviceIdHex: demoHex,
+        deviceName: 'Sonic-Echo',
+        fingerprint: '7A3F-C091',
+        estimatedDistanceMeters: 1.4,
+        signalLevel: 0.85,
+        lastSeen: DateTime.now(),
+        isSimulated: true,
+      );
+      _selectedPeer = _discoveredPeers[demoId];
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        backgroundColor: SonicTheme.teal,
+        content: Text('Demo Test Receiver "Sonic-Echo (4B21-9E10)" added and validated!'),
+        duration: Duration(seconds: 2),
+      ),
+    );
+  }
+
+  void _showManualPeerDialog() {
+    final hexController = TextEditingController(text: '7B3A-1C92');
+    final nameController = TextEditingController(text: 'Sonic-Peer-2');
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: SonicTheme.surfaceElevated,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('Add Target Receiver Manually', style: TextStyle(color: SonicTheme.cyan, fontSize: 16)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'Enter the 4-byte Hex ID of the target SonicMesh device.',
+              style: TextStyle(color: SonicTheme.textSecondary, fontSize: 12),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: hexController,
+              style: const TextStyle(fontFamily: 'monospace', color: SonicTheme.textPrimary),
+              decoration: const InputDecoration(
+                labelText: 'Device Hex ID (e.g. 7B3A-1C92)',
+                labelStyle: TextStyle(color: SonicTheme.textMuted),
+                filled: true,
+                fillColor: SonicTheme.surface,
+              ),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: nameController,
+              style: const TextStyle(color: SonicTheme.textPrimary),
+              decoration: const InputDecoration(
+                labelText: 'Device Name (Optional)',
+                labelStyle: TextStyle(color: SonicTheme.textMuted),
+                filled: true,
+                fillColor: SonicTheme.surface,
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('CANCEL', style: TextStyle(color: SonicTheme.textMuted)),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              final raw = hexController.text.replaceAll('-', '').trim();
+              final id = int.tryParse(raw, radix: 16);
+              if (id == null) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Invalid Hex Device ID')),
+                );
+                return;
+              }
+              final name = nameController.text.trim().isEmpty ? 'Sonic-$raw' : nameController.text.trim();
+              final formattedHex = raw.length >= 8 ? '${raw.substring(0, 4)}-${raw.substring(4, 8)}' : raw;
+
+              setState(() {
+                _discoveredPeers[id] = DiscoveredPeer(
+                  deviceId: id,
+                  deviceIdHex: formattedHex,
+                  deviceName: name,
+                  fingerprint: 'USER-KEY',
+                  estimatedDistanceMeters: 2.0,
+                  signalLevel: 0.70,
+                  lastSeen: DateTime.now(),
+                );
+                _selectedPeer = _discoveredPeers[id];
+              });
+              Navigator.pop(ctx);
+            },
+            style: ElevatedButton.styleFrom(backgroundColor: SonicTheme.cyan, foregroundColor: Colors.black),
+            child: const Text('ADD RECEIVER'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _sendPrivateMessage() async {
-    if (_selectedPeer == null) {
+    final text = _textController.text.trim();
+    if (text.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Please select and validate a receiver first!'),
+          content: Text('Please enter a message to send'),
           backgroundColor: SonicTheme.coral,
         ),
       );
       return;
     }
 
-    final text = _textController.text.trim();
-    if (text.isEmpty) return;
+    if (_selectedPeer == null) {
+      final pick = await showModalBottomSheet<String>(
+        context: context,
+        backgroundColor: SonicTheme.surfaceElevated,
+        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+        builder: (ctx) => Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text(
+                'NO RECEIVER SELECTED',
+                style: TextStyle(fontWeight: FontWeight.bold, color: SonicTheme.cyan, letterSpacing: 1.2),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Private acoustic messaging requires a validated receiver device ID in the packet header.',
+                style: TextStyle(color: SonicTheme.textSecondary, fontSize: 13),
+              ),
+              const SizedBox(height: 16),
+              ElevatedButton.icon(
+                onPressed: () => Navigator.pop(ctx, 'DEMO'),
+                icon: const Icon(Icons.flash_on),
+                label: const Text('USE DEMO RECEIVER (SONIC-ECHO)'),
+                style: ElevatedButton.styleFrom(backgroundColor: SonicTheme.teal, foregroundColor: Colors.black),
+              ),
+              const SizedBox(height: 10),
+              OutlinedButton.icon(
+                onPressed: () => Navigator.pop(ctx, 'PING'),
+                icon: const Icon(Icons.radar),
+                label: const Text('PING AIR-GAP RECEIVERS NOW'),
+                style: OutlinedButton.styleFrom(foregroundColor: SonicTheme.cyan),
+              ),
+            ],
+          ),
+        ),
+      );
+
+      if (pick == 'DEMO') {
+        _addDemoPeer();
+      } else if (pick == 'PING') {
+        _pingNearbyDevices();
+        return;
+      } else {
+        return;
+      }
+    }
+
+    if (_selectedPeer == null) return;
 
     await _channel.sendPrivateMessage(
       receiverId: _selectedPeer!.deviceId,
@@ -278,8 +460,13 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
         actions: [
           IconButton(
             icon: const Icon(Icons.radar),
-            tooltip: 'Ping Nearby Receivers',
-            onPressed: _pingNearbyDevices,
+            tooltip: 'Ping Air-Gap Receivers',
+            onPressed: () => _pingNearbyDevices(),
+          ),
+          IconButton(
+            icon: const Icon(Icons.playlist_add),
+            tooltip: 'Add Demo Test Peer',
+            onPressed: _addDemoPeer,
           ),
         ],
       ),
@@ -402,10 +589,10 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
                 ],
               ),
               Row(
-                children: [
-                  const Icon(Icons.shield_outlined, size: 14, color: SonicTheme.teal),
-                  const SizedBox(width: 4),
-                  const Text(
+                children: const [
+                  Icon(Icons.shield_outlined, size: 14, color: SonicTheme.teal),
+                  SizedBox(width: 4),
+                  Text(
                     'ECDSA P-256',
                     style: TextStyle(fontSize: 11, color: SonicTheme.teal),
                   ),
@@ -447,29 +634,106 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
                   ),
                 ],
               ),
-              ElevatedButton.icon(
-                onPressed: _isPinging ? null : _pingNearbyDevices,
-                icon: _isPinging
-                    ? const SizedBox(
-                        width: 14,
-                        height: 14,
-                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                      )
-                    : const Icon(Icons.podcasts, size: 16),
-                label: Text(_isPinging ? 'PINGING...' : 'PING RECEIVERS'),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: SonicTheme.cyan,
-                  foregroundColor: Colors.black,
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  textStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: _discoveredPeers.isNotEmpty
+                      ? SonicTheme.teal.withValues(alpha: 0.2)
+                      : SonicTheme.surface,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: _discoveredPeers.isNotEmpty ? SonicTheme.teal : SonicTheme.border,
+                  ),
+                ),
+                child: Text(
+                  '${_discoveredPeers.length} DETECTED',
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    color: _discoveredPeers.isNotEmpty ? SonicTheme.teal : SonicTheme.textMuted,
+                  ),
                 ),
               ),
             ],
           ),
           const SizedBox(height: 12),
+
+          Row(
+            children: [
+              Expanded(
+                flex: 3,
+                child: ElevatedButton.icon(
+                  onPressed: _isPinging ? null : () => _pingNearbyDevices(),
+                  icon: _isPinging
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                        )
+                      : const Icon(Icons.podcasts, size: 16),
+                  label: Text(_isPinging ? 'PINGING...' : 'PING RECEIVERS'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: SonicTheme.cyan,
+                    foregroundColor: Colors.black,
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    textStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                flex: 2,
+                child: OutlinedButton.icon(
+                  onPressed: _addDemoPeer,
+                  icon: const Icon(Icons.flash_on, size: 15, color: SonicTheme.teal),
+                  label: const Text('TEST PEER', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: SonicTheme.teal,
+                    side: const BorderSide(color: SonicTheme.teal),
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton(
+                icon: const Icon(Icons.add_circle_outline, color: SonicTheme.cyan, size: 20),
+                tooltip: 'Add Custom ID',
+                onPressed: _showManualPeerDialog,
+              ),
+            ],
+          ),
+
+          if (_isPinging) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: SonicTheme.cyan.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Row(
+                children: [
+                  const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: SonicTheme.cyan),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      _pingStatus,
+                      style: const TextStyle(fontSize: 11, color: SonicTheme.cyan),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+
+          const SizedBox(height: 12),
           if (_discoveredPeers.isEmpty) ...[
             Container(
-              padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 16),
+              padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
               alignment: Alignment.center,
               decoration: BoxDecoration(
                 color: SonicTheme.surface,
@@ -489,9 +753,28 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
                   Text(
                     _isPinging
                         ? 'Broadcasting ultrasonic PING (16.5 kHz / 17.5 kHz)...'
-                        : 'No validated receivers yet. Tap "PING RECEIVERS" to discover nearby devices via acoustics.',
+                        : 'No validated receivers detected yet.',
                     textAlign: TextAlign.center,
                     style: const TextStyle(fontSize: 12, color: SonicTheme.textSecondary),
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    alignment: WrapAlignment.center,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    spacing: 8,
+                    children: [
+                      TextButton.icon(
+                        onPressed: () => _pingNearbyDevices(),
+                        icon: const Icon(Icons.volume_up, size: 14, color: SonicTheme.cyan),
+                        label: const Text('Air-Gap Ping', style: TextStyle(fontSize: 11, color: SonicTheme.cyan)),
+                      ),
+                      const Text('•', style: TextStyle(color: SonicTheme.textMuted)),
+                      TextButton.icon(
+                        onPressed: _addDemoPeer,
+                        icon: const Icon(Icons.bolt, size: 14, color: SonicTheme.teal),
+                        label: const Text('Add Demo Echo Peer', style: TextStyle(fontSize: 11, color: SonicTheme.teal)),
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -536,20 +819,21 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              Row(
+                              Wrap(
+                                crossAxisAlignment: WrapCrossAlignment.center,
+                                spacing: 6,
+                                runSpacing: 2,
                                 children: [
                                   Text(
                                     peer.deviceName,
                                     style: const TextStyle(
                                       fontWeight: FontWeight.bold,
-                                      fontSize: 14,
+                                      fontSize: 13,
                                       color: SonicTheme.textPrimary,
                                     ),
                                   ),
-                                  const SizedBox(width: 8),
                                   Container(
-                                    padding: const EdgeInsets.symmetric(
-                                        horizontal: 6, vertical: 2),
+                                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
                                     decoration: BoxDecoration(
                                       color: SonicTheme.surfaceElevated,
                                       borderRadius: BorderRadius.circular(6),
@@ -558,11 +842,23 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
                                       peer.deviceIdHex,
                                       style: const TextStyle(
                                         fontFamily: 'monospace',
-                                        fontSize: 11,
+                                        fontSize: 10,
                                         color: SonicTheme.cyan,
                                       ),
                                     ),
                                   ),
+                                  if (peer.isSimulated)
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                                      decoration: BoxDecoration(
+                                        color: SonicTheme.teal.withValues(alpha: 0.2),
+                                        borderRadius: BorderRadius.circular(4),
+                                      ),
+                                      child: const Text(
+                                        'ECHO',
+                                        style: TextStyle(fontSize: 8, fontWeight: FontWeight.bold, color: SonicTheme.teal),
+                                      ),
+                                    ),
                                 ],
                               ),
                               const SizedBox(height: 4),
@@ -581,16 +877,14 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
                           crossAxisAlignment: CrossAxisAlignment.end,
                           children: [
                             Container(
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 8, vertical: 3),
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                               decoration: BoxDecoration(
                                 color: SonicTheme.teal.withValues(alpha: 0.2),
                                 borderRadius: BorderRadius.circular(8),
                               ),
                               child: Row(
                                 children: [
-                                  const Icon(Icons.straighten,
-                                      size: 12, color: SonicTheme.teal),
+                                  const Icon(Icons.straighten, size: 12, color: SonicTheme.teal),
                                   const SizedBox(width: 4),
                                   Text(
                                     '~${peer.estimatedDistanceMeters.toStringAsFixed(1)}m',
@@ -605,7 +899,7 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
                             ),
                             const SizedBox(height: 4),
                             Text(
-                              'VERIFIED PEER',
+                              isSelected ? 'ACTIVE TARGET' : 'TAP TO SELECT',
                               style: TextStyle(
                                 fontSize: 9,
                                 fontWeight: FontWeight.bold,
@@ -660,14 +954,21 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
                     color: SonicTheme.textPrimary,
                   ),
                 ),
-                Text(
-                  'Only this device will decrypt the message. Other devices will ignore.',
+                const Text(
+                  'Header encrypted for this receiver. Other devices will reject packet.',
                   style: TextStyle(fontSize: 11, color: SonicTheme.textSecondary),
                 ),
               ],
             ),
           ),
-          const Icon(Icons.check_circle, color: SonicTheme.teal, size: 20),
+          TextButton(
+            onPressed: () {
+              setState(() {
+                _selectedPeer = null;
+              });
+            },
+            child: const Text('CLEAR', style: TextStyle(color: SonicTheme.textMuted, fontSize: 11)),
+          ),
         ],
       ),
     );
@@ -685,18 +986,33 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Row(
-            children: const [
-              Icon(Icons.send_outlined, color: SonicTheme.cyan, size: 18),
-              SizedBox(width: 8),
-              Text(
-                'PRIVATE MESSAGE COMPOSER',
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.bold,
-                  letterSpacing: 1.2,
-                  color: SonicTheme.textPrimary,
+            children: [
+              const Icon(Icons.send_outlined, color: SonicTheme.cyan, size: 18),
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text(
+                  'PRIVATE MESSAGE COMPOSER',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1.0,
+                    color: SonicTheme.textPrimary,
+                  ),
+                  overflow: TextOverflow.ellipsis,
                 ),
               ),
+              if (_selectedPeer != null)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: SonicTheme.cyan.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Text(
+                    _selectedPeer!.deviceIdHex,
+                    style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: SonicTheme.cyan),
+                  ),
+                ),
             ],
           ),
           const SizedBox(height: 12),
@@ -706,7 +1022,7 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
             style: const TextStyle(color: SonicTheme.textPrimary, fontSize: 14),
             decoration: InputDecoration(
               hintText: _selectedPeer == null
-                  ? 'Select a nearby receiver first...'
+                  ? 'Enter private message (select receiver above or tap transmit to pick)...'
                   : 'Enter private message to ${_selectedPeer!.deviceName}...',
               hintStyle: const TextStyle(color: SonicTheme.textMuted),
               filled: true,
@@ -741,11 +1057,11 @@ class _PrivateMessagingScreenState extends State<PrivateMessagingScreen>
             const SizedBox(height: 12),
           ],
           ElevatedButton.icon(
-            onPressed: (_isTransmitting || _selectedPeer == null)
-                ? null
-                : _sendPrivateMessage,
+            onPressed: _isTransmitting ? null : _sendPrivateMessage,
             icon: const Icon(Icons.shield_outlined),
-            label: const Text('TRANSMIT PRIVATE MESSAGE (ACOUSTIC)'),
+            label: Text(_selectedPeer == null
+                ? 'SELECT RECEIVER & TRANSMIT'
+                : 'TRANSMIT PRIVATE MESSAGE (ACOUSTIC)'),
             style: ElevatedButton.styleFrom(
               backgroundColor: SonicTheme.cyan,
               foregroundColor: Colors.black,

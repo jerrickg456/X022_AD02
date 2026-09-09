@@ -58,7 +58,8 @@ class MainActivity : FlutterActivity() {
                 result.success(acousticEngine.identityManager.toMap())
             }
             "startPing" -> {
-                acousticEngine.sendPing()
+                val loopback = call.argument<Boolean>("loopback") ?: false
+                acousticEngine.sendPing(loopback)
                 result.success(true)
             }
             "sendPrivateMessage" -> {

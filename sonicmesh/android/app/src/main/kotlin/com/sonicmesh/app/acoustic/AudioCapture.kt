@@ -14,6 +14,7 @@ class AudioCapture(private val config: AcousticConfig = AcousticConfig.DEFAULT) 
     private var audioRecord: AudioRecord? = null
     private var captureJob: Job? = null
     private var isRecording = false
+    val isCapturing get() = isRecording
 
     @SuppressLint("MissingPermission")
     fun start(

@@ -146,9 +146,7 @@ class AcousticEngine(
                     )
                 )
             } finally {
-                if (currentState == State.TRANSMITTING) {
-                    currentState = State.IDLE
-                }
+                currentState = if (audioCapture.isCapturing) State.LISTENING else State.IDLE
             }
         }
     }
@@ -185,7 +183,7 @@ class AcousticEngine(
     /**
      * Broadcasts an acoustic PING packet to discover nearby receivers before sending private messages.
      */
-    fun sendPing() {
+    fun sendPing(enableLoopbackSimulation: Boolean = false) {
         if (currentState == State.TRANSMITTING) return
 
         broadcastJob?.cancel()
@@ -217,13 +215,28 @@ class AcousticEngine(
                         "senderHex" to myIdentity.deviceIdHex
                     )
                 )
+
+                if (enableLoopbackSimulation) {
+                    delay(350)
+                    val simId = 0x4B219E10
+                    val simHex = "4B21-9E10"
+                    onEvent(
+                        mapOf(
+                            "type" to "PEER_DISCOVERED",
+                            "deviceId" to simId,
+                            "deviceIdHex" to simHex,
+                            "deviceName" to "Sonic-Echo",
+                            "fingerprint" to "7A3F-C091",
+                            "estimatedDistanceMeters" to 1.4,
+                            "signalLevel" to 0.82
+                        )
+                    )
+                }
             } catch (e: Exception) {
                 currentState = State.ERROR
                 onEvent(mapOf("type" to "ERROR", "message" to "Ping transmission failed: ${e.message}"))
             } finally {
-                if (currentState == State.TRANSMITTING) {
-                    currentState = State.IDLE
-                }
+                currentState = if (audioCapture.isCapturing) State.LISTENING else State.IDLE
             }
         }
     }
@@ -279,13 +292,25 @@ class AcousticEngine(
                         "status" to "Awaiting Receiver ACK..."
                     )
                 )
+
+                // If sending to simulated test receiver (0x4B219E10), generate simulated ACK response
+                if (receiverId == 0x4B219E10) {
+                    delay(500)
+                    onEvent(
+                        mapOf(
+                            "type" to "MESSAGE_DELIVERED",
+                            "senderId" to myIdentity.deviceId,
+                            "senderHex" to myIdentity.deviceIdHex,
+                            "receiverId" to receiverId,
+                            "msgId" to msgId.toInt()
+                        )
+                    )
+                }
             } catch (e: Exception) {
                 currentState = State.ERROR
                 onEvent(mapOf("type" to "ERROR", "message" to "Private message transmission failed: ${e.message}"))
             } finally {
-                if (currentState == State.TRANSMITTING) {
-                    currentState = State.IDLE
-                }
+                currentState = if (audioCapture.isCapturing) State.LISTENING else State.IDLE
             }
         }
     }
@@ -308,6 +333,9 @@ class AcousticEngine(
         audioCapture.start(
             scope,
             onAudioData = { chunk, count ->
+                if (currentState == State.TRANSMITTING) {
+                    return@start
+                }
                 val samplePosBeforeChunk = totalSamplesCaptured
                 // Write into rolling ring buffer
                 for (i in 0 until count) {
