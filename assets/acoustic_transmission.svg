@@ -1,0 +1,149 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 280" width="100%" height="100%">
+  <defs>
+    <linearGradient id="panelBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0F172A"/>
+      <stop offset="100%" stop-color="#020617"/>
+    </linearGradient>
+
+    <linearGradient id="packetGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#0284C7"/>
+      <stop offset="50%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#10B981"/>
+    </linearGradient>
+
+    <filter id="glowFilt" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="4" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <style>
+    @keyframes soundRipples {
+      0% { r: 6px; opacity: 0.9; }
+      100% { r: 42px; opacity: 0; }
+    }
+    @keyframes packetFly1 {
+      0% { transform: translateX(0px); opacity: 0; }
+      15% { opacity: 1; }
+      85% { opacity: 1; }
+      100% { transform: translateX(330px); opacity: 0; }
+    }
+    @keyframes packetFly2 {
+      0% { transform: translateX(0px); opacity: 0; }
+      15% { opacity: 1; }
+      85% { opacity: 1; }
+      100% { transform: translateX(330px); opacity: 0; }
+    }
+    @keyframes checkmarkFlash {
+      0%, 100% { stroke: #10B981; filter: drop-shadow(0 0 4px #10B981); }
+      50% { stroke: #34D399; filter: drop-shadow(0 0 8px #34D399); }
+    }
+    .ripple1 { animation: soundRipples 2s linear infinite; }
+    .ripple2 { animation: soundRipples 2s linear infinite 0.6s; }
+    .ripple3 { animation: soundRipples 2s linear infinite 1.2s; }
+    .p1 { animation: packetFly1 3.5s cubic-bezier(0.4, 0, 0.2, 1) infinite; }
+    .p2 { animation: packetFly2 3.5s cubic-bezier(0.4, 0, 0.2, 1) infinite 1.75s; }
+    .verified-check { animation: checkmarkFlash 2s infinite ease-in-out; }
+  </style>
+
+  <!-- Container Box -->
+  <rect width="940" height="280" rx="14" fill="url(#panelBg)" stroke="#334155" stroke-width="1.5"/>
+
+  <!-- Section Titles -->
+  <text x="35" y="32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#38BDF8" letter-spacing="1">1. BROADCASTER (TRANSMITTER)</text>
+  <text x="400" y="32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#F59E0B" letter-spacing="1">2. ACOUSTIC AIR CHANNEL (FSK)</text>
+  <text x="730" y="32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#10B981" letter-spacing="1">3. RECEIVERS (SIMULTANEOUS)</text>
+
+  <!-- ==================== LEFT: BROADCASTER NODE ==================== -->
+  <g transform="translate(35, 50)">
+    <rect width="210" height="200" rx="10" fill="#1E293B" stroke="#475569" stroke-width="1"/>
+    
+    <!-- Header -->
+    <rect width="210" height="34" rx="10" fill="#0F172A"/>
+    <rect x="0" y="24" width="210" height="10" fill="#0F172A"/>
+    <circle cx="20" cy="17" r="5" fill="#38BDF8"/>
+    <text x="34" y="21" font-family="monospace" font-size="11" font-weight="700" fill="#E2E8F0">PHONE A [Tx]</text>
+
+    <!-- Pipeline steps -->
+    <g transform="translate(15, 48)">
+      <rect x="0" y="0" width="180" height="22" rx="4" fill="#0284C7" fill-opacity="0.2" stroke="#0284C7" stroke-width="1"/>
+      <text x="10" y="15" font-family="monospace" font-size="10.5" fill="#38BDF8">Message Payload</text>
+
+      <path d="M 90 23 L 90 32" stroke="#64748B" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+      <rect x="0" y="34" width="180" height="22" rx="4" fill="#0284C7" fill-opacity="0.2" stroke="#0284C7" stroke-width="1"/>
+      <text x="10" y="49" font-family="monospace" font-size="10.5" fill="#38BDF8">Packetizer + CRC32 + FEC</text>
+
+      <rect x="0" y="68" width="180" height="22" rx="4" fill="#0284C7" fill-opacity="0.2" stroke="#0284C7" stroke-width="1"/>
+      <text x="10" y="83" font-family="monospace" font-size="10.5" fill="#38BDF8">FSK Modulator (f₀/f₁)</text>
+
+      <rect x="0" y="102" width="180" height="26" rx="4" fill="#0369A1" stroke="#38BDF8" stroke-width="1.5"/>
+      <text x="25" y="119" font-family="monospace" font-size="11" font-weight="700" fill="#FFFFFF">🔊 AudioTrack Speaker</text>
+    </g>
+
+    <!-- Pulsing Sound Waves from Speaker -->
+    <circle class="ripple1" cx="210" cy="165" r="8" fill="none" stroke="#38BDF8" stroke-width="2"/>
+    <circle class="ripple2" cx="210" cy="165" r="8" fill="none" stroke="#00F5FF" stroke-width="1.8"/>
+    <circle class="ripple3" cx="210" cy="165" r="8" fill="none" stroke="#818CF8" stroke-width="1.5"/>
+  </g>
+
+  <!-- ==================== CENTER: AIR PROPAGATION ==================== -->
+  <g transform="translate(265, 50)">
+    <rect width="390" height="200" rx="10" fill="#0B1120" stroke="#1E293B" stroke-width="1" stroke-dasharray="4 4"/>
+    
+    <!-- Medium Tag -->
+    <text x="195" y="26" font-family="monospace" font-size="10.5" fill="#64748B" text-anchor="middle">Physical Medium: Air (Acoustic Pressure Waves)</text>
+    <text x="195" y="42" font-family="monospace" font-size="9.5" fill="#475569" text-anchor="middle">Distance: 1m - 25m • Audio Freq: 16 kHz - 19.5 kHz</text>
+
+    <!-- Animated Sine Waves propagating -->
+    <g transform="translate(20, 105)" opacity="0.6">
+      <path d="M 0 0 Q 20 -20, 40 0 T 80 0 T 120 0 T 160 0 T 200 0 T 240 0 T 280 0 T 320 0 T 350 0" fill="none" stroke="#06B6D4" stroke-width="2"/>
+      <path d="M 0 10 Q 15 -10, 30 10 T 60 10 T 90 10 T 120 10 T 150 10 T 180 10 T 210 10 T 240 10 T 270 10 T 300 10 T 330 10 T 350 10" fill="none" stroke="#818CF8" stroke-width="1.5"/>
+    </g>
+
+    <!-- Animated Flying Packet 1 -->
+    <g class="p1" transform="translate(10, 68)">
+      <rect width="90" height="30" rx="5" fill="#0F172A" stroke="#00F5FF" stroke-width="1.5" filter="url(#glowFilt)"/>
+      <text x="45" y="19" font-family="monospace" font-size="10" font-weight="700" fill="#38BDF8" text-anchor="middle">PKT #001 [CRC]</text>
+    </g>
+
+    <!-- Animated Flying Packet 2 -->
+    <g class="p2" transform="translate(10, 130)">
+      <rect width="90" height="30" rx="5" fill="#0F172A" stroke="#10B981" stroke-width="1.5" filter="url(#glowFilt)"/>
+      <text x="45" y="19" font-family="monospace" font-size="10" font-weight="700" fill="#34D399" text-anchor="middle">PKT #002 [FEC]</text>
+    </g>
+  </g>
+
+  <!-- ==================== RIGHT: RECEIVERS ==================== -->
+  <g transform="translate(685, 50)">
+    <!-- Rx 1 -->
+    <g transform="translate(0, 0)">
+      <rect width="220" height="58" rx="8" fill="#1E293B" stroke="#10B981" stroke-width="1.5"/>
+      <circle cx="18" cy="29" r="6" fill="#065F46"/>
+      <path class="verified-check" d="M 15 29 L 17 31 L 21 27" fill="none" stroke-width="2" stroke-linecap="round"/>
+      <text x="32" y="23" font-family="monospace" font-size="11" font-weight="700" fill="#FFFFFF">PHONE B (Receiver 1)</text>
+      <text x="32" y="41" font-family="monospace" font-size="9.5" fill="#34D399">🎤 Mic → Goertzel → CRC OK ✓</text>
+    </g>
+
+    <!-- Rx 2 -->
+    <g transform="translate(0, 71)">
+      <rect width="220" height="58" rx="8" fill="#1E293B" stroke="#10B981" stroke-width="1.5"/>
+      <circle cx="18" cy="29" r="6" fill="#065F46"/>
+      <path class="verified-check" d="M 15 29 L 17 31 L 21 27" fill="none" stroke-width="2" stroke-linecap="round"/>
+      <text x="32" y="23" font-family="monospace" font-size="11" font-weight="700" fill="#FFFFFF">PHONE C (Receiver 2)</text>
+      <text x="32" y="41" font-family="monospace" font-size="9.5" fill="#34D399">🎤 Mic → Sync Found → CRC OK ✓</text>
+    </g>
+
+    <!-- Rx 3 (Relay Node) -->
+    <g transform="translate(0, 142)">
+      <rect width="220" height="58" rx="8" fill="#1E293B" stroke="#C084FC" stroke-width="1.5"/>
+      <circle cx="18" cy="29" r="6" fill="#581C87"/>
+      <path d="M 15 29 L 17 31 L 21 27" fill="none" stroke="#C084FC" stroke-width="2" stroke-linecap="round"/>
+      <text x="32" y="23" font-family="monospace" font-size="11" font-weight="700" fill="#FFFFFF">PHONE D (Relay Node)</text>
+      <text x="32" y="41" font-family="monospace" font-size="9.5" fill="#E879F9">🎤 Verified → Retransmit (TTL-1)</text>
+    </g>
+  </g>
+</svg>
