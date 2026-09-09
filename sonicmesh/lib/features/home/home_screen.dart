@@ -45,6 +45,14 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               _buildSectionTitle('OPERATIONS'),
               const SizedBox(height: 12),
               _buildActionCard(
+                title: 'VALIDATE & PRIVATE CHAT',
+                subtitle: 'Ping nearby receivers, verify ID/keys & unicast with acoustic ACK',
+                icon: Icons.shield_outlined,
+                accentColor: SonicTheme.teal,
+                onTap: () => Navigator.pushNamed(context, Routes.privateMessaging),
+              ),
+              const SizedBox(height: 14),
+              _buildActionCard(
                 title: 'BROADCAST CONSOLE',
                 subtitle: 'Transmit packets via continuous-phase acoustic FSK',
                 icon: Icons.cell_tower,

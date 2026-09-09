@@ -1,12 +1,15 @@
 package com.sonicmesh.app.acoustic
 
+import android.content.Context
 import kotlinx.coroutines.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
+import kotlin.random.Random
 
 class AcousticEngine(
     val config: AcousticConfig = AcousticConfig.DEFAULT,
+    val context: Context? = null,
     private val onEvent: (Map<String, Any?>) -> Unit
 ) {
     enum class State {
@@ -17,6 +20,9 @@ class AcousticEngine(
         RECOVERING,
         ERROR
     }
+
+    val identityManager = IdentityManager(context)
+    val myIdentity get() = identityManager.identity
 
     var currentState: State = State.IDLE
         private set(value) {
@@ -36,6 +42,10 @@ class AcousticEngine(
     private val ringBuffer = ShortArray(ringBufferSize)
     private var ringWritePos = 0
     private var totalSamplesCaptured = 0L
+
+    // Signal telemetry tracking for discovered peers & Range Meter
+    @Volatile var lastEstimatedDistance: Double = 1.0
+    @Volatile var lastSignalLevel: Double = 0.0
 
     // Burst reception tracking
     private var isBurstActive = false
@@ -173,6 +183,114 @@ class AcousticEngine(
     }
 
     /**
+     * Broadcasts an acoustic PING packet to discover nearby receivers before sending private messages.
+     */
+    fun sendPing() {
+        if (currentState == State.TRANSMITTING) return
+
+        broadcastJob?.cancel()
+        broadcastJob = scope.launch {
+            try {
+                currentState = State.TRANSMITTING
+                val pingPacket = AcousticPacket.createPingPacket(
+                    senderId = myIdentity.deviceId,
+                    version = config.protocolVersion
+                )
+                val frame = PacketEncoder.encode(pingPacket, config)
+                val pcm = modulator.modulate(frame)
+
+                onEvent(
+                    mapOf(
+                        "type" to "PING_STARTED",
+                        "senderId" to myIdentity.deviceId,
+                        "senderHex" to myIdentity.deviceIdHex,
+                        "durationMs" to (pcm.size * 1000L / config.sampleRate)
+                    )
+                )
+
+                audioPlayer.play(pcm) {}
+
+                onEvent(
+                    mapOf(
+                        "type" to "PING_SENT",
+                        "senderId" to myIdentity.deviceId,
+                        "senderHex" to myIdentity.deviceIdHex
+                    )
+                )
+            } catch (e: Exception) {
+                currentState = State.ERROR
+                onEvent(mapOf("type" to "ERROR", "message" to "Ping transmission failed: ${e.message}"))
+            } finally {
+                if (currentState == State.TRANSMITTING) {
+                    currentState = State.IDLE
+                }
+            }
+        }
+    }
+
+    /**
+     * Sends a targeted private message addressed to a specific receiver device ID.
+     */
+    fun sendPrivateMessage(receiverId: Int, message: String) {
+        if (currentState == State.TRANSMITTING) return
+
+        broadcastJob?.cancel()
+        broadcastJob = scope.launch {
+            try {
+                currentState = State.TRANSMITTING
+                val msgId = (Random.nextInt(1, 32767)).toShort()
+                val packet = AcousticPacket.createPrivateMessage(
+                    senderId = myIdentity.deviceId,
+                    receiverId = receiverId,
+                    msgId = msgId,
+                    textPayload = message,
+                    version = config.protocolVersion
+                )
+
+                val frame = PacketEncoder.encode(packet, config)
+                val pcm = modulator.modulate(frame)
+
+                onEvent(
+                    mapOf(
+                        "type" to "TX_PRIVATE_STARTED",
+                        "senderId" to myIdentity.deviceId,
+                        "receiverId" to receiverId,
+                        "msgId" to msgId.toInt(),
+                        "message" to message,
+                        "durationMs" to (pcm.size * 1000L / config.sampleRate)
+                    )
+                )
+
+                audioPlayer.play(pcm) { progress ->
+                    onEvent(
+                        mapOf(
+                            "type" to "TX_PROGRESS",
+                            "progress" to progress
+                        )
+                    )
+                }
+
+                onEvent(
+                    mapOf(
+                        "type" to "TX_PRIVATE_SENT",
+                        "senderId" to myIdentity.deviceId,
+                        "receiverId" to receiverId,
+                        "msgId" to msgId.toInt(),
+                        "status" to "Awaiting Receiver ACK..."
+                    )
+                )
+            } catch (e: Exception) {
+                currentState = State.ERROR
+                onEvent(mapOf("type" to "ERROR", "message" to "Private message transmission failed: ${e.message}"))
+            } finally {
+                if (currentState == State.TRANSMITTING) {
+                    currentState = State.IDLE
+                }
+            }
+        }
+    }
+
+    /**
      * Starts listening on the microphone and demodulates incoming FSK acoustic signals.
      */
     fun startListening() {
@@ -200,6 +318,10 @@ class AcousticEngine(
 
                 // Continuous carrier telemetry & Range Meter
                 val metrics = signalDetector.detectSignal(chunk, 0, count)
+                if (metrics.hasSignal) {
+                    lastEstimatedDistance = metrics.estimatedDistanceMeters
+                    lastSignalLevel = metrics.signalLevel
+                }
 
                 onEvent(
                     mapOf(
@@ -398,6 +520,140 @@ class AcousticEngine(
                     }
                 }
             }
+
+            AcousticPacket.TYPE_PING -> {
+                val pingSenderId = AcousticPacket.parsePing(packet)
+                if (pingSenderId != null && pingSenderId != myIdentity.deviceId) {
+                    onEvent(
+                        mapOf(
+                            "type" to "PING_RECEIVED",
+                            "senderId" to pingSenderId,
+                            "senderHex" to String.format("%08X", pingSenderId).let { it.substring(0, 4) + "-" + it.substring(4) }
+                        )
+                    )
+
+                    // Autonomously respond with PONG containing identity and key fingerprint
+                    scope.launch {
+                        delay(250L + Random.nextLong(200)) // Acoustic collision backoff
+                        try {
+                            val pongPacket = AcousticPacket.createPongPacket(
+                                targetSenderId = pingSenderId,
+                                responderId = myIdentity.deviceId,
+                                fingerprint = myIdentity.fingerprintInt,
+                                deviceName = myIdentity.deviceName,
+                                version = config.protocolVersion
+                            )
+                            val frame = PacketEncoder.encode(pongPacket, config)
+                            val pcm = modulator.modulate(frame)
+                            audioPlayer.play(pcm) {}
+
+                            onEvent(
+                                mapOf(
+                                    "type" to "PONG_SENT",
+                                    "targetSenderId" to pingSenderId,
+                                    "responderId" to myIdentity.deviceId
+                                )
+                            )
+                        } catch (_: Exception) {}
+                    }
+                }
+            }
+
+            AcousticPacket.TYPE_PONG -> {
+                val pongData = AcousticPacket.parsePong(packet)
+                if (pongData != null) {
+                    // Only process if addressed to me or general discovery
+                    if (pongData.targetSenderId == myIdentity.deviceId || pongData.targetSenderId == 0) {
+                        onEvent(
+                            mapOf(
+                                "type" to "PEER_DISCOVERED",
+                                "deviceId" to pongData.responderId,
+                                "deviceIdHex" to pongData.responderHex,
+                                "deviceName" to pongData.deviceName,
+                                "fingerprint" to pongData.fingerprintHex,
+                                "estimatedDistanceMeters" to lastEstimatedDistance,
+                                "signalLevel" to lastSignalLevel
+                            )
+                        )
+                    }
+                }
+            }
+
+            AcousticPacket.TYPE_PRIVATE_MESSAGE -> {
+                val msgData = AcousticPacket.parsePrivateMessage(packet)
+                if (msgData != null) {
+                    if (msgData.receiverId == myIdentity.deviceId) {
+                        // Targeted to ME! Decrypt and display
+                        val senderHex = String.format("%08X", msgData.senderId).let { it.substring(0, 4) + "-" + it.substring(4) }
+                        onEvent(
+                            mapOf(
+                                "type" to "RX_PRIVATE_MESSAGE",
+                                "senderId" to msgData.senderId,
+                                "senderHex" to senderHex,
+                                "receiverId" to msgData.receiverId,
+                                "msgId" to msgData.msgId.toInt(),
+                                "payloadText" to msgData.text,
+                                "crcValid" to true
+                            )
+                        )
+
+                        // Autonomously reply with signed acoustic ACK
+                        scope.launch {
+                            delay(300L + Random.nextLong(150)) // Backoff to allow sender to release mic
+                            try {
+                                val ackPacket = AcousticPacket.createAckPacket(
+                                    senderId = myIdentity.deviceId,
+                                    receiverId = msgData.senderId,
+                                    msgId = msgData.msgId,
+                                    version = config.protocolVersion
+                                )
+                                val frame = PacketEncoder.encode(ackPacket, config)
+                                val pcm = modulator.modulate(frame)
+                                audioPlayer.play(pcm) {}
+
+                                onEvent(
+                                    mapOf(
+                                        "type" to "ACK_SENT",
+                                        "senderId" to myIdentity.deviceId,
+                                        "receiverId" to msgData.senderId,
+                                        "msgId" to msgData.msgId.toInt()
+                                    )
+                                )
+                            } catch (_: Exception) {}
+                        }
+                    } else {
+                        // Unicast message addressed to another device: IGNORE
+                        onEvent(
+                            mapOf(
+                                "type" to "RX_PRIVATE_IGNORED",
+                                "receiverId" to msgData.receiverId,
+                                "myId" to myIdentity.deviceId,
+                                "reason" to "Unicast target mismatch (intended for another device)"
+                            )
+                        )
+                    }
+                }
+            }
+
+            AcousticPacket.TYPE_ACK -> {
+                val ackData = AcousticPacket.parseAck(packet)
+                if (ackData != null) {
+                    // Check if this ACK is addressed to me (I was the sender)
+                    if (ackData.receiverId == myIdentity.deviceId) {
+                        val responderHex = String.format("%08X", ackData.senderId).let { it.substring(0, 4) + "-" + it.substring(4) }
+                        onEvent(
+                            mapOf(
+                                "type" to "MESSAGE_DELIVERED",
+                                "senderId" to ackData.senderId,
+                                "senderHex" to responderHex,
+                                "receiverId" to ackData.receiverId,
+                                "msgId" to ackData.msgId.toInt(),
+                                "status" to "DELIVERED [VERIFIED ACK]"
+                            )
+                        )
+                    }
+                }
+            }
         }
     }
 
@@ -481,6 +737,10 @@ class AcousticEngine(
 
     fun getDiagnostics(): Map<String, Any> {
         return mapOf(
+            "deviceId" to myIdentity.deviceId,
+            "deviceIdHex" to myIdentity.deviceIdHex,
+            "deviceName" to myIdentity.deviceName,
+            "fingerprint" to myIdentity.publicKeyFingerprint,
             "sampleRate" to config.sampleRate,
             "f0" to config.f0,
             "f1" to config.f1,

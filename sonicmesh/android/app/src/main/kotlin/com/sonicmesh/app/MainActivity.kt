@@ -29,7 +29,7 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        acousticEngine = AcousticEngine(AcousticConfig.DEFAULT) { eventData ->
+        acousticEngine = AcousticEngine(AcousticConfig.DEFAULT, context = this) { eventData ->
             mainHandler.post {
                 eventSink?.success(eventData)
             }
@@ -54,6 +54,19 @@ class MainActivity : FlutterActivity() {
 
     private fun handleMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
+            "getIdentity" -> {
+                result.success(acousticEngine.identityManager.toMap())
+            }
+            "startPing" -> {
+                acousticEngine.sendPing()
+                result.success(true)
+            }
+            "sendPrivateMessage" -> {
+                val receiverId = call.argument<Int>("receiverId") ?: 0
+                val message = call.argument<String>("message") ?: ""
+                acousticEngine.sendPrivateMessage(receiverId, message)
+                result.success(true)
+            }
             "hasAudioPermission" -> {
                 val granted = ContextCompat.checkSelfPermission(
                     this,

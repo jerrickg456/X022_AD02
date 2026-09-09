@@ -149,5 +149,115 @@ class AcousticDspTest {
         assertTrue(metricsNear.signalLevel > 50.0)
         assertTrue("Near field distance should be small (< 3.0m)", metricsNear.estimatedDistanceMeters < 3.0)
     }
+
+    @Test
+    fun testPingPongPacketEncodingAndParsing() {
+        val config = AcousticConfig.DEFAULT
+        val modulator = Modulator(config)
+        val demodulator = Demodulator(config)
+
+        // 1. Test PING
+        val senderId = 0x1A2B3C4D
+        val pingPacket = AcousticPacket.createPingPacket(senderId, config.protocolVersion)
+        val pingFrame = PacketEncoder.encode(pingPacket, config)
+        val pingPcm = modulator.modulate(pingFrame)
+
+        val decodedPingPacket = demodulator.demodulate(pingPcm)
+        assertNotNull("PING packet should be decoded", decodedPingPacket)
+        val parsedSenderId = AcousticPacket.parsePing(decodedPingPacket!!)
+        assertEquals(senderId, parsedSenderId)
+
+        // 2. Test PONG
+        val responderId = 0x5E6F7A8B
+        val fingerprint = 0x01020304
+        val devName = "Sonic-Echo"
+        val pongPacket = AcousticPacket.createPongPacket(
+            targetSenderId = senderId,
+            responderId = responderId,
+            fingerprint = fingerprint,
+            deviceName = devName,
+            version = config.protocolVersion
+        )
+        val pongFrame = PacketEncoder.encode(pongPacket, config)
+        val pongPcm = modulator.modulate(pongFrame)
+
+        val decodedPongPacket = demodulator.demodulate(pongPcm)
+        assertNotNull("PONG packet should be decoded", decodedPongPacket)
+        val pongData = AcousticPacket.parsePong(decodedPongPacket!!)
+        assertNotNull("PONG data should be parsed", pongData)
+        assertEquals(senderId, pongData!!.targetSenderId)
+        assertEquals(responderId, pongData.responderId)
+        assertEquals(devName, pongData.deviceName)
+        assertTrue(pongData.responderHex.contains("5E6F"))
+    }
+
+    @Test
+    fun testPrivateMessageTargetingAndAck() {
+        val config = AcousticConfig.DEFAULT
+        val modulator = Modulator(config)
+        val demodulator = Demodulator(config)
+
+        val senderId = 0x11223344
+        val targetReceiverId = 0x55667788
+        val otherReceiverId = 0x99AABBCC.toInt()
+        val msgId: Short = 101
+        val secretMessage = "Classified: Meet at checkpoint Charlie"
+
+        // 1. Send Private Message
+        val privPacket = AcousticPacket.createPrivateMessage(
+            senderId = senderId,
+            receiverId = targetReceiverId,
+            msgId = msgId,
+            textPayload = secretMessage,
+            version = config.protocolVersion
+        )
+        val privFrame = PacketEncoder.encode(privPacket, config)
+        val privPcm = modulator.modulate(privFrame)
+
+        val decodedPrivPacket = demodulator.demodulate(privPcm)
+        assertNotNull("Private message packet should be demodulated", decodedPrivPacket)
+        val msgData = AcousticPacket.parsePrivateMessage(decodedPrivPacket!!)
+        assertNotNull("Private message data should be parsed", msgData)
+        assertEquals(senderId, msgData!!.senderId)
+        assertEquals(targetReceiverId, msgData.receiverId)
+        assertEquals(msgId, msgData.msgId)
+        assertEquals(secretMessage, msgData.text)
+
+        // Validate targeted receiver filtering
+        val acceptedByTarget = (msgData.receiverId == targetReceiverId)
+        val acceptedByOther = (msgData.receiverId == otherReceiverId)
+        assertTrue("Intended receiver must accept the private message", acceptedByTarget)
+        assertFalse("Other device must reject/ignore the private message", acceptedByOther)
+
+        // 2. Validate ACK response
+        val ackPacket = AcousticPacket.createAckPacket(
+            senderId = targetReceiverId,
+            receiverId = senderId,
+            msgId = msgId,
+            version = config.protocolVersion
+        )
+        val ackFrame = PacketEncoder.encode(ackPacket, config)
+        val ackPcm = modulator.modulate(ackFrame)
+
+        val decodedAckPacket = demodulator.demodulate(ackPcm)
+        assertNotNull("ACK packet should be demodulated", decodedAckPacket)
+        val ackData = AcousticPacket.parseAck(decodedAckPacket!!)
+        assertNotNull("ACK data should be parsed", ackData)
+        assertEquals(targetReceiverId, ackData!!.senderId)
+        assertEquals(senderId, ackData.receiverId)
+        assertEquals(msgId, ackData.msgId)
+    }
+
+    @Test
+    fun testIdentityGeneration() {
+        val identityManager = IdentityManager(null)
+        val identity = identityManager.identity
+        assertNotNull(identity)
+        assertTrue("Device ID should be non-zero", identity.deviceId != 0)
+        assertTrue("Device Hex should be formatted", identity.deviceIdHex.contains("-"))
+        assertTrue("Device Name should start with Sonic-", identity.deviceName.startsWith("Sonic-"))
+        assertTrue("Fingerprint should be formatted", identity.publicKeyFingerprint.contains("-"))
+        assertTrue("Fingerprint int should be non-zero", identity.fingerprintInt != 0)
+    }
 }
 

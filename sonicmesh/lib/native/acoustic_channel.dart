@@ -100,6 +100,36 @@ class AcousticChannel {
     }
   }
 
+  Future<Map<String, dynamic>> getIdentity() async {
+    try {
+      final res = await _methodChannel.invokeMethod<Map>('getIdentity');
+      return Map<String, dynamic>.from(res ?? {});
+    } catch (_) {
+      return {};
+    }
+  }
+
+  Future<bool> startPing() async {
+    try {
+      final res = await _methodChannel.invokeMethod<bool>('startPing');
+      return res ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> sendPrivateMessage({required int receiverId, required String message}) async {
+    try {
+      final res = await _methodChannel.invokeMethod<bool>('sendPrivateMessage', {
+        'receiverId': receiverId,
+        'message': message,
+      });
+      return res ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<Map<String, dynamic>> getDiagnostics() async {
     try {
       final res = await _methodChannel.invokeMethod<Map>('getDiagnostics');

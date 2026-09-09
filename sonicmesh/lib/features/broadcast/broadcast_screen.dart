@@ -214,6 +214,13 @@ class _BroadcastScreenState extends State<BroadcastScreen> with SingleTickerProv
                 minHeight: 6,
               ),
             ),
+            if (_audioDurationMs > 0) ...[
+              const SizedBox(height: 6),
+              Text(
+                'Acoustic Frame: ~${(_audioDurationMs / 1000).toStringAsFixed(1)}s ($_audioSamples samples)',
+                style: const TextStyle(fontSize: 10, color: SonicTheme.textMuted),
+              ),
+            ],
           ],
         ],
       ),

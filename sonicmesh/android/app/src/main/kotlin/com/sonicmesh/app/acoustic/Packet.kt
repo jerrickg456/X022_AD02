@@ -2,6 +2,7 @@ package com.sonicmesh.app.acoustic
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.charset.StandardCharsets
 
 data class AcousticPacket(
     val version: Byte = 1,
@@ -14,8 +15,10 @@ data class AcousticPacket(
         const val TYPE_DATA: Byte = 0x01
         const val TYPE_PING: Byte = 0x02
         const val TYPE_ACK: Byte = 0x03
-        const val TYPE_RETRANS_REQ: Byte = 0x04   // NACK: requesting retransmission of missing sequence
-        const val TYPE_RETRANS_RESP: Byte = 0x05  // ARQ response with requested sequence
+        const val TYPE_RETRANS_REQ: Byte = 0x04   // NACK: requesting retransmission
+        const val TYPE_RETRANS_RESP: Byte = 0x05  // ARQ response
+        const val TYPE_PONG: Byte = 0x06          // Peer discovery response
+        const val TYPE_PRIVATE_MESSAGE: Byte = 0x07 // Targeted unicast message
         const val HEADER_SIZE: Int = 8 // version(1) + type(1) + seq(2) + total(2) + length(2)
         const val CRC_SIZE: Int = 4
         const val SYNC_WORD: Byte = 0x7E
@@ -38,6 +41,188 @@ data class AcousticPacket(
                 sequenceNumber = missingSequence,
                 totalPackets = totalExpected,
                 payload = payload
+            )
+        }
+
+        /**
+         * Creates an acoustic PING packet broadcasted to discover nearby receivers.
+         */
+        fun createPingPacket(senderId: Int, version: Byte = 1): AcousticPacket {
+            val payload = ByteArray(6)
+            val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+            buf.putInt(senderId)
+            buf.putShort(1.toShort()) // Nonce / Ping seq
+            return AcousticPacket(
+                version = version,
+                type = TYPE_PING,
+                sequenceNumber = 1,
+                totalPackets = 1,
+                payload = payload
+            )
+        }
+
+        fun parsePing(packet: AcousticPacket): Int? {
+            if (packet.type != TYPE_PING || packet.payload.size < 4) return null
+            val buf = ByteBuffer.wrap(packet.payload).order(ByteOrder.BIG_ENDIAN)
+            return buf.int
+        }
+
+        /**
+         * Creates an acoustic PONG response containing device identity, key fingerprint, and name.
+         */
+        fun createPongPacket(
+            targetSenderId: Int,
+            responderId: Int,
+            fingerprint: Int,
+            deviceName: String,
+            version: Byte = 1
+        ): AcousticPacket {
+            val nameBytes = deviceName.toByteArray(StandardCharsets.UTF_8).let {
+                if (it.size > 12) it.copyOfRange(0, 12) else it
+            }
+            val payload = ByteArray(4 + 4 + 4 + 1 + nameBytes.size)
+            val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+            buf.putInt(targetSenderId)
+            buf.putInt(responderId)
+            buf.putInt(fingerprint)
+            buf.put(nameBytes.size.toByte())
+            buf.put(nameBytes)
+
+            return AcousticPacket(
+                version = version,
+                type = TYPE_PONG,
+                sequenceNumber = 1,
+                totalPackets = 1,
+                payload = payload
+            )
+        }
+
+        data class PongData(
+            val targetSenderId: Int,
+            val responderId: Int,
+            val responderHex: String,
+            val fingerprintHex: String,
+            val deviceName: String
+        )
+
+        fun parsePong(packet: AcousticPacket): PongData? {
+            if (packet.type != TYPE_PONG || packet.payload.size < 13) return null
+            val buf = ByteBuffer.wrap(packet.payload).order(ByteOrder.BIG_ENDIAN)
+            val targetSenderId = buf.int
+            val responderId = buf.int
+            val fingerprint = buf.int
+            val nameLen = buf.get().toInt() and 0xFF
+            if (buf.remaining() < nameLen) return null
+            val nameBytes = ByteArray(nameLen)
+            buf.get(nameBytes)
+            val name = String(nameBytes, StandardCharsets.UTF_8)
+
+            val hex = String.format("%08X", responderId)
+            val shortHex = hex.substring(0, 4) + "-" + hex.substring(4)
+            val fp = String.format("%08X", fingerprint)
+            val fpFormatted = fp.substring(0, 4) + "-" + fp.substring(4)
+
+            return PongData(
+                targetSenderId = targetSenderId,
+                responderId = responderId,
+                responderHex = shortHex,
+                fingerprintHex = fpFormatted,
+                deviceName = name
+            )
+        }
+
+        /**
+         * Creates a targeted private message addressed to a specific Receiver Device ID.
+         */
+        fun createPrivateMessage(
+            senderId: Int,
+            receiverId: Int,
+            msgId: Short,
+            textPayload: String,
+            version: Byte = 1
+        ): AcousticPacket {
+            val textBytes = textPayload.toByteArray(StandardCharsets.UTF_8)
+            val payload = ByteArray(4 + 4 + 2 + textBytes.size)
+            val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+            buf.putInt(senderId)
+            buf.putInt(receiverId)
+            buf.putShort(msgId)
+            buf.put(textBytes)
+
+            return AcousticPacket(
+                version = version,
+                type = TYPE_PRIVATE_MESSAGE,
+                sequenceNumber = 1,
+                totalPackets = 1,
+                payload = payload
+            )
+        }
+
+        data class PrivateMessageData(
+            val senderId: Int,
+            val receiverId: Int,
+            val msgId: Short,
+            val text: String
+        )
+
+        fun parsePrivateMessage(packet: AcousticPacket): PrivateMessageData? {
+            if (packet.type != TYPE_PRIVATE_MESSAGE || packet.payload.size < 10) return null
+            val buf = ByteBuffer.wrap(packet.payload).order(ByteOrder.BIG_ENDIAN)
+            val senderId = buf.int
+            val receiverId = buf.int
+            val msgId = buf.short
+            val textBytes = ByteArray(buf.remaining())
+            buf.get(textBytes)
+            val text = String(textBytes, StandardCharsets.UTF_8)
+
+            return PrivateMessageData(
+                senderId = senderId,
+                receiverId = receiverId,
+                msgId = msgId,
+                text = text
+            )
+        }
+
+        /**
+         * Creates an acoustic delivery ACK packet confirming receipt and decryption.
+         */
+        fun createAckPacket(
+            senderId: Int,
+            receiverId: Int,
+            msgId: Short,
+            version: Byte = 1
+        ): AcousticPacket {
+            val payload = ByteArray(4 + 4 + 2)
+            val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+            buf.putInt(senderId)
+            buf.putInt(receiverId)
+            buf.putShort(msgId)
+
+            return AcousticPacket(
+                version = version,
+                type = TYPE_ACK,
+                sequenceNumber = 1,
+                totalPackets = 1,
+                payload = payload
+            )
+        }
+
+        data class AckData(
+            val senderId: Int,
+            val receiverId: Int,
+            val msgId: Short
+        )
+
+        fun parseAck(packet: AcousticPacket): AckData? {
+            if (packet.type != TYPE_ACK || packet.payload.size < 10) return null
+            val buf = ByteBuffer.wrap(packet.payload).order(ByteOrder.BIG_ENDIAN)
+            val senderId = buf.int
+            val receiverId = buf.int
+            val msgId = buf.short
+            return AckData(
+                senderId = senderId,
+                receiverId = receiverId,
+                msgId = msgId
             )
         }
     }
@@ -104,9 +289,6 @@ object PacketDecoder {
         data class Error(val message: String) : Result()
     }
 
-    /**
-     * Attempts to find preamble, sync word, and decode the frame from raw received bytes.
-     */
     fun decode(rawBytes: ByteArray, config: AcousticConfig = AcousticConfig.DEFAULT): Result {
         if (rawBytes.size < config.preambleCount + 1 + AcousticPacket.HEADER_SIZE + AcousticPacket.CRC_SIZE) {
             return Result.Error("Data too short for valid packet frame: ${rawBytes.size} bytes")
