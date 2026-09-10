@@ -1,7 +1,7 @@
 # SonicMesh: Product Requirements Document (PRD)
 
 ### Infrastructure-Free Acoustic Communication Network for Android
-**Version:** 1.2.0  
+**Version:** 1.4.0  
 **Status:** Implemented & Verified Live on Hardware  
 **Repository:** [github.com/jerrickg456/X022_AD02](https://github.com/jerrickg456/X022_AD02)  
 
@@ -22,8 +22,8 @@ Operating entirely in the near-ultrasound spectrum ($16.5\text{ kHz} - 17.5\text
 | **Wi-Fi** | **STRICTLY PROHIBITED** | No network permissions (`INTERNET`, `ACCESS_WIFI_STATE`) in AndroidManifest. |
 | **Bluetooth / BLE** | **STRICTLY PROHIBITED** | No Bluetooth permissions (`BLUETOOTH`, `BLUETOOTH_CONNECT`, `BLUETOOTH_SCAN`). |
 | **Cellular Data / GSM / 5G**| **STRICTLY PROHIBITED** | Functions 100% in Airplane Mode. |
-| **Cloud / External Servers**| **STRICTLY PROHIBITED** | Pure device-to-device physical acoustic waves. |
-| **Required Permissions** | **MICROPHONE ONLY** | `android.permission.RECORD_AUDIO` strictly for acoustic demodulation. |
+| **Cloud / External Servers**| **STRICTLY PROHIBITED** | Pure device-to-device physical acoustic waves and local on-device processing. |
+| **Required Permissions** | **MICROPHONE ONLY** | `android.permission.RECORD_AUDIO` strictly for acoustic demodulation and local offline voice transcription. |
 
 ---
 
@@ -44,7 +44,7 @@ The physical layer modulates binary data into continuous acoustic sound waves us
 * **Symbol Duration ($T_s$):** $40\text{ ms}$
 * **Baud Rate:** $25\text{ Baud}$ ($25\text{ bits/second}$)
 * **Samples Per Symbol ($N$):** $1,764\text{ samples}$ at $44,100\text{ Hz}$
-* **Continuous Phase Guarantee:** Phase continuity ($\Delta \theta = 0$) maintained across bit transitions to eliminate audio pops and spectral splatter.
+* **Continuous Phase Guarantee:** Phase continuity ($\Delta \theta = 0$) maintained across bit transitions to eliminate audio clicks and spectral splatter.
 * **Envelope Shaping:** Raised cosine edge ramp ($5\text{ ms}$) on transmission burst start and end.
 
 ### 3.2 Human Audibility & Stealth
@@ -59,21 +59,23 @@ The physical layer modulates binary data into continuous acoustic sound waves us
 ```
 +----------------+----------------+----------------+----------------+
 | Preamble (4 B) | Sync Word (1B) | Header (8 B)   | Payload (N B)  | CRC32 (4 B)
-| 0xAA 0xAA...   | 0x7E (01111110)| Ver/Type/Seq.. | UTF-8 Data     | IEEE 802.3
+| 0xAA 0xAA...   | 0x7E (01111110)| Ver/Type/Seq.. | Binary/Text    | IEEE 802.3
 +----------------+----------------+----------------+----------------+
 ```
 
-### 4.2 Header Fields (8 Bytes Big-Endian)
-1. **Protocol Version (1 Byte):** Default `0x01`.
-2. **Packet Type (1 Byte):**
-   * `0x01` — `TYPE_DATA` (Standard text payload)
-   * `0x02` — `TYPE_PING` (Beacon heartbeat)
-   * `0x03` — `TYPE_ACK` (Receipt acknowledgment)
-   * `0x04` — `TYPE_RETRANS_REQ` (Acoustic NACK requesting missing packet chunk)
-   * `0x05` — `TYPE_RETRANS_RESP` (Autonomous retransmission chunk response)
-3. **Sequence Number (2 Bytes):** Index of current fragment ($1 \le seq \le total$).
-4. **Total Packets (2 Bytes):** Total fragments in current transmission session.
-5. **Payload Length (2 Bytes):** Byte length of payload ($0 \le len \le 1024$).
+### 4.2 Packet Types & Opcodes
+| Opcode | Packet Type | Description |
+| :--- | :--- | :--- |
+| `0x01` | `TYPE_DATA` | Standard broadcast text payload. |
+| `0x02` | `TYPE_PING` | Ultrasonic beacon heartbeat query. |
+| `0x03` | `TYPE_ACK` | Signed delivery receipt acknowledgment. |
+| `0x04` | `TYPE_RETRANS_REQ` | Acoustic NACK requesting missing packet chunks. |
+| `0x05` | `TYPE_RETRANS_RESP` | Autonomous retransmission chunk response. |
+| `0x06` | `TYPE_PONG` | Discovery response with device ID, name, and ECDSA fingerprint. |
+| `0x07` | `TYPE_PRIVATE_MESSAGE` | Targeted unicast payload addressed to specific recipient. |
+| `0x10` | `TYPE_IMAGE_START` | Image transfer initiation (dimensions, byte size, format, total chunks). |
+| `0x11` | `TYPE_IMAGE_CHUNK` | 48-byte sliced binary image payload with chunk sequence index. |
+| `0x12` | `TYPE_IMAGE_END` | Image transfer termination with full-file CRC-32 integrity seal. |
 
 ### 4.3 Error Detection: CRC-32
 * **Polynomial:** IEEE 802.3 standard (`0xEDB88320` reversed).
@@ -81,187 +83,191 @@ The physical layer modulates binary data into continuous acoustic sound waves us
 
 ---
 
-## 5. Incomplete Reception Recovery & Autonomous ARQ
+## 5. Persistent Broadcast Timer
 
-Due to room reverberation, distance attenuation, or transient noise, receivers may miss frames or receive partial fragments. SonicMesh incorporates a dual-tier recovery system:
+For search-and-rescue beacons, automated SOS alerts, and emergency area status broadcasts, SonicMesh provides an automated persistent transmission engine:
 
-```mermaid
-sequenceDiagram
-    participant TX as Transmitter
-    participant RX as Receiver
-    TX->>RX: Chunks 1/2 Transmitted
-    Note over RX: Fading causes Chunk 2/2 dropped
-    Note over RX: Incomplete reception detected (Missing #2)
-    RX->>TX: Acoustic NACK: TYPE_RETRANS_REQ(missing=2, total=2)
-    Note over TX: Cache hit: Chunk #2 found in memory
-    TX->>RX: Autonomous Re-broadcast: TYPE_RETRANS_RESP(seq=2)
-    Note over RX: Reassembly complete & CRC-32 verified!
-```
-
-### 5.1 Multi-Chunk Fragmentation & Reassembly
-* Long messages or multi-hop relays are automatically fragmented into indexed chunks ($seq / total$).
-* The receiver tracks arrived sequence indices in a sliding reassembly window.
-* When all fragments arrive, the complete message is reassembled in order and verified against CRC-32.
-
-### 5.2 Reactive Acoustic ARQ (NACK)
-* When a receiver detects a partial session (e.g., received Chunk 1, missing Chunk 2) or a burst terminates without valid CRC:
-  * Emits an ultra-compact acoustic NACK beacon (`TYPE_RETRANS_REQ`, 4-byte payload).
-  * Any nearby mesh peer or the original transmitter holding the message in cache autonomously serves the missing chunk (`TYPE_RETRANS_RESP`).
-  * Eliminates the need for the sender to manually coordinate with each receiver.
-
-### 5.3 Proactive Redundancy Profiles
-Transmitters can operate in one of three reliability profiles:
-1. **1x Standard:** Single transmission burst for normal acoustic channels.
-2. **2x Robust (ARQ):** Dual burst repetition with $250\text{ ms}$ guard silence.
-3. **3x High-Noise:** Triple burst repetition for distant or noisy environments.
+* **Configurable Durations:** Presets for 30 seconds, 1 minute, 2 minutes, 5 minutes, or custom timer windows.
+* **In-Memory Caching:** Automatically caches the latest message payload in native RAM.
+* **Configurable Repeat Interval:** Automatically retransmits the cached acoustic packet every configurable interval (default: 5 seconds) until the timer expires.
+* **Live Telemetry & Cancellation:** Real-time countdown timer, live repeat counter, animated transmission waves, and a single-tap **Stop Broadcast** button that instantly halts the hardware synthesizer.
+* **100% Offline:** Operates entirely over the existing 2-CPFSK physical pipeline without any network calls.
 
 ---
 
-## 6. Acoustic Range & Distance Estimator (Range Meter)
+## 6. Acoustic Store-and-Forward Relay Node
 
-SonicMesh implements a real-time **Acoustic Range Meter** estimating physical distance between transmitter and receiver without GPS, Wi-Fi RTT, or Bluetooth RSSI.
+To bridge communication gaps when transmitters and receivers are separated by distance or acoustic barriers ($\text{Phone A} \to \text{Phone B} \to \text{Phone C}$):
 
-### 6.1 Mathematical Model: Log-Distance Acoustic Path Loss
-Acoustic wave intensity decreases geometrically in an indoor room:
-$$P(d) = P(d_0) \cdot \left(\frac{d_0}{d}\right)^\gamma$$
+```
+[Phone A] ──(Weak 16.5-17.5 kHz FSK)──> [Phone B Mic]
+                                             │
+                       ┌─────────────────────┴─────────────────────┐
+                       │ 1. AudioRecord captures weak PCM stream   │
+                       │ 2. SignalDetector tracks carrier power    │
+                       │ 3. Goertzel/Demodulator decodes symbols   │
+                       │ 4. Frame Parser extracts packet bytes     │
+                       │ 5. CRC32 Checksum verifies 100% integrity │
+                       │ 6. Deduplication Cache prevents loops     │
+                       │ 7. 500ms Turnaround Guard Delay pauses    │
+                       │ 8. Modulator synthesizes BRAND-NEW CPFSK  │
+                       │ 9. AudioTrack plays full-power signal     │
+                       └─────────────────────┬─────────────────────┘
+                                             │
+                                   [Phone B Speaker]
+                                             │
+                    ──(Fresh, Strong 100% Acoustic Signal)──> [Phone C]
+```
 
-Solving for distance $d$ with reference distance $d_0 = 1.0\text{ m}$:
+### 6.1 Zero Analog Amplification Rule
+Phone B strictly **never amplifies or echoes microphone audio**. The weak audio signal is fully demodulated to its raw digital bytes, verified for 100% CRC-32 integrity, and re-synthesized as a pristine, brand-new CPFSK carrier at full amplitude.
+
+### 6.2 Echo & Loop Suppression
+1. **60-Second Signature Deduplication:** Packets are hashed by type, sequence, and payload CRC32. Repeated packets heard within 60 seconds are suppressed (`LOOP SUPPRESSED`).
+2. **Turnaround Guard Delay:** Configurable 500ms delay between reception and relay re-broadcast allows room reverberations to clear.
+3. **Half-Duplex Silencing:** Microphone capture is ignored during transmitter playback to prevent self-triggering.
+
+---
+
+## 7. Offline Microphone Voice Input (Speech-to-Text)
+
+To facilitate rapid hands-free broadcast creation during emergency or tactical operations:
+
+* **Engine:** Android native `SpeechRecognizer` configured with `EXTRA_PREFER_OFFLINE = true` and offline fallback service binding.
+* **API Compatibility:** Declared `<queries>` for `RecognitionService` in `AndroidManifest.xml` for full Android 11+ (API 30+) compliance.
+* **User Workflow:**
+  1. User taps the **VOICE** badge or microphone icon in the Broadcast Console.
+  2. Offline recognizer activates with live RMS level audio wave feedback.
+  3. Spoken words are transcribed into text in real-time.
+  4. Transcribed text auto-fills the message payload field, allowing the user to review, edit, or append text prior to acoustic transmission.
+
+---
+
+## 8. Offline Read Aloud Speaker (Text-to-Speech)
+
+To support eyes-free situation awareness and auditory alert dispatch:
+
+* **Engine:** Android native `TextToSpeech` engine (`com.google.android.tts` / local voice synthesis engine).
+* **API Compatibility:** Declared `<queries>` for `android.intent.action.TTS_SERVICE` in `AndroidManifest.xml`.
+* **Controls & Lifecycle:**
+  * Interactive `READ`, `PAUSE`, `RESUME`, and `STOP` controls.
+  * Real-time `UtteranceProgressListener` tracking (`TTS_STARTED`, `TTS_COMPLETED`, `TTS_STOPPED`, `TTS_ERROR`).
+* **Placement:**
+  * **Receiver Console:** Speaker controls on every decoded message card.
+  * **Private Messaging:** Quick read-aloud speaker icon on all received incoming chat bubbles.
+
+---
+
+## 9. Complete Offline Acoustic Image Transfer
+
+Enables transmission of compressed visual data across the acoustic channel without any RF connectivity:
+
+```
+[Gallery / Camera Image]
+          │
+          ▼
+[Intelligent Scaler]
+   • Thumbnail Mode: 64×64 pixels (ultra-fast transmission)
+   • Standard Mode: 128×128 pixels (detailed visual data)
+          │
+          ▼
+[WebP Binary Compression (Quality 50-70)]
+   • Compress to compact binary stream (300 - 1500 bytes)
+          │
+          ▼
+[Packet Fragmentation (48-Byte Payload Frames)]
+   • Frame 0: TYPE_IMAGE_START (Dimensions, Size, Format, Chunks)
+   • Frame 1..N: TYPE_IMAGE_CHUNK (Chunk Index, Payload, Chunk CRC32)
+   • Frame N+1: TYPE_IMAGE_END (Total Chunks, Full-File CRC32)
+          │
+          ▼
+[2-CPFSK Acoustic Synthesizer (25 Baud)]
+          │
+     AIR LINK (Speaker ──> Microphone)
+          │
+          ▼
+[Receiver Demodulator & Chunk Store]
+   • Per-chunk CRC32 validation
+   • Sequential buffer reassembly
+   • Full-file CRC32 verification
+   • Persisted to local storage (`filesDir/sonic_images/img_{id}.webp`)
+   • Verified Image Preview Card with dimensions and byte badges
+```
+
+### 9.1 Pre-Transmission Telemetry
+Before transmission begins, the sender UI calculates and displays:
+* WebP compressed byte count.
+* Total required acoustic chunk frames.
+* Precise estimated transmission duration in seconds ($\approx \text{chunks} \times 17.5\text{s}$).
+
+---
+
+## 10. Acoustic Range & Distance Estimator (Range Meter)
+
+SonicMesh implements a real-time **Acoustic Range Meter** estimating physical distance between transmitter and receiver using the **Log-Distance Acoustic Path Loss Model**:
+
 $$d = \left(\frac{P_{1\text{m}}}{\max(P_0, P_1) + \epsilon}\right)^{\frac{1}{\gamma}}$$
 
-* **$P_{1\text{m}}$:** Reference carrier power at $1\text{ meter}$ ($0.50$ calibrated).
+* **$P_{1\text{m}}$:** Calibrated reference carrier power at $1\text{ meter}$ ($0.50$).
 * **$\gamma$:** Indoor acoustic path loss exponent ($1.9$ nominal).
-* **Smoothing Filter:** $\bar{d}_t = 0.7 \cdot \bar{d}_{t-1} + 0.3 \cdot d_t$ to dampen air turbulence and room reflections.
-
-### 6.2 Proximity Classification Zones
-| Zone | Distance Range | Physical Context |
-| :--- | :--- | :--- |
-| **IMMEDIATE** | $< 1.0\text{ m}$ | Direct table contact, handheld proximity. |
-| **NEAR** | $1.0\text{ m} - 3.0\text{ m}$ | Same desk or workstation area. |
-| **MID-RANGE** | $3.0\text{ m} - 7.0\text{ m}$ | Across the room. |
-| **FAR** | $> 7.0\text{ m}$ | Long-range indoor link, threshold of SNR. |
+* **Zones:** `IMMEDIATE (< 1.0m)`, `NEAR (1.0m - 3.0m)`, `MID-RANGE (3.0m - 7.0m)`, `FAR (> 7.0m)`.
 
 ---
 
-## 7. Receiver Validation Before Sending & Targeted Unicast Protocol
+## 11. Receiver Validation & Targeted Private Unicast Protocol
 
-To guarantee confidential delivery and verify receiver availability prior to transmission, SonicMesh implements **Acoustic Receiver Validation**.
+Guarantees confidential point-to-point delivery prior to message dispatch:
 
-```
-  SENDER (Node A)                              RECEIVER (Node B)
-        |                                              |
-        | ----------- Acoustic PING (0x02) ----------> | (Nearby discovery broadcast)
-        |                                              |
-        | <---------- Acoustic PONG (0x06) ----------- | (Device ID, Fingerprint, Name)
-        |                                              |
-[Selects B from list]                                  |
-        |                                              |
-        | ----- PRIVATE_MESSAGE (0x07, Target=B) ----> | (Encrypted/addressed to B)
-        |                                              | [Receiver ID matches: Decrypts]
-        |                                              | [Other nodes: Silently ignore]
-        |                                              |
-        | <--------- Acoustic ACK (0x03) ------------- | (Signed delivery receipt)
-        |                                              |
-[Status: DELIVERED]                                    |
-```
-
-### 7.1 Persistent Device Identity & Key Derivation (`IdentityManager.kt`)
-* **Device ID:** Unique 32-bit integer persisted in `SharedPreferences`, displayed in formatted hex `SM-XXXX` (e.g. `1A2B-3C4D`).
-* **Device Name:** Human-readable moniker (e.g. `Sonic-1A2B`).
-* **Public Key Fingerprint:** Synthetic ECDSA P-256 public key hash (`SHA-256` derived, formatted `XXXX-XXXX`).
-
-### 7.2 Packet Format & Unicast Addressing
-1. **PING Packet (`0x02`):**
-   * Payload: `senderId (4B) | nonce (2B)`
-   * Function: Broadcasted to wake and query active receivers.
-2. **PONG Packet (`0x06`):**
-   * Payload: `targetSenderId (4B) | responderId (4B) | fingerprint (4B) | nameLen (1B) | nameBytes`
-   * Function: Responded autonomously with acoustic backoff ($250\text{ ms} - 450\text{ ms}$) to avoid air collision.
-3. **PRIVATE_MESSAGE Packet (`0x07`):**
-   * Header: `senderId (4B) | receiverId (4B) | msgId (2B) | payloadText`
-   * Filtering: If `packet.receiverId == myIdentity.deviceId`, decrypt and display. If mismatch, silently drop and record `unaddressed packet ignored`.
-4. **ACK Packet (`0x03`):**
-   * Header: `senderId (4B) | receiverId (4B) | msgId (2B)`
-   * Function: Autonomously emitted by the target recipient. Sender transitions message status to `DELIVERED [VERIFIED ACK]`.
+1. **PING Discovery (`0x02`):** Broadcasts acoustic ping to discover nearby active receivers.
+2. **PONG Response (`0x06`):** Receivers respond with device ID, friendly name, and synthetic ECDSA P-256 public key fingerprint.
+3. **Targeted Selection:** Sender selects recipient; non-target devices discard unaddressed packets.
+4. **Signed Acoustic ACK (`0x03`):** Target recipient autonomously replies with an acoustic delivery receipt, updating sender status to `DELIVERED [VERIFIED ACK]`.
 
 ---
 
-## 8. System Architecture & Native DSP Implementation
+## 12. System Architecture & Component Mapping
 
 ```
 +-------------------------------------------------------------+
 |                      FLUTTER UI LAYER                       |
-|   (Theme / Routes / Broadcast / Receiver / Range / Private) |
+|   (Broadcast / Receiver / Private / Relay / Persistent)     |
 +-------------------------------------------------------------+
-                              |
-    MethodChannel ("control") | EventChannel ("events")
-                              |
+                              │
+    MethodChannel ("control") │ EventChannel ("events")
+                              │
 +-------------------------------------------------------------+
 |                     ANDROID KOTLIN NATIVE                   |
-|                   com.sonicmesh.app.acoustic                |
-|                                                             |
-|  +-------------------+  +----------------+  +------------+  |
-|  | IdentityManager.kt|  | AudioPlayer.kt |  | Packet.kt  |  |
-|  +-------------------+  +----------------+  +------------+  |
-|                                                             |
-|  +-------------------+  +----------------+  +------------+  |
-|  | AcousticEngine.kt |  | AudioCapture.kt|  | Goertzel.kt|  |
-|  +-------------------+  +----------------+  +------------+  |
-|                                                             |
-|  +-------------------+  +----------------+  +------------+  |
-|  | Modulator.kt      |  | Demodulator.kt |  | Detector.kt|  |
-|  +-------------------+  +----------------+  +------------+  |
+|  +--------------------+  +--------------------+  +-------+  |
+|  | SpeechRecognizer   |  | TextToSpeech       |  | Packet|  |
+|  | Manager.kt         |  | Manager.kt         |  | .kt   |  |
+|  +--------------------+  +--------------------+  +-------+  |
+|  +--------------------+  +--------------------+  +-------+  |
+|  | ImageTransfer      |  | IdentityManager    |  | FSK   |  |
+|  | Manager.kt         |  | .kt                |  | Mod.kt|  |
+|  +--------------------+  +--------------------+  +-------+  |
+|  +--------------------+  +--------------------+  +-------+  |
+|  | AcousticEngine.kt  |  | AudioCapture.kt    |  | Goert.|  |
+|  +--------------------+  +--------------------+  +-------+  |
 +-------------------------------------------------------------+
 ```
 
-### 8.1 Native Kotlin DSP Components
-* **`IdentityManager.kt`:** Generates, stores, and supplies unique device identity, friendly name, and synthetic ECDSA fingerprint.
-* **`AcousticEngine.kt`:** Finite state machine managing audio streams, PING/PONG discovery loops, targeted unicast filtering, ACK verification, and ARQ reassembly.
-* **`Packet.kt`:** Binary serialization/deserialization for DATA (`0x01`), PING (`0x02`), ACK (`0x03`), RETRANS_REQ (`0x04`), RETRANS_RESP (`0x05`), PONG (`0x06`), and PRIVATE_MESSAGE (`0x07`).
-* **`Modulator.kt`:** Continuous-phase FSK modulator.
-* **`Demodulator.kt`:** Robust over-the-air Goertzel detector with gain tilt balancing and windowed sync matching.
-* **`SignalDetector.kt`:** RMS level measurement and real-time acoustic Range Meter estimation.
-
 ---
 
-## 9. User Interface & Experience Design
+## 13. Verification Matrix
 
-* **Design Philosophy:** Cyberpunk military-grade tactical dark mode with glassmorphic cards, glowing cyan/teal accents, and monospace telemetry.
-* **Interactive Consoles:**
-  * **Validate & Private Chat:**
-    * My Identity Banner (Device ID `SM-XXXX`, ECDSA key fingerprint).
-    * Ultrasonic radar ping pulse controller.
-    * Nearby Discovered Devices list with live Range Meter distance (`~0.8m`, `~1.5m`).
-    * Targeted recipient selection & unicast packet composer.
-    * Real-time delivery status badge (`DELIVERED [VERIFIED ACK]`).
-    * Private inbox with unaddressed message filtering.
-  * **Broadcast Console:** One-to-many broadcast with redundancy (`1x`, `2x`, `3x`) and autonomous ARQ cache.
-  * **Receiver & Range Console:** Live carrier detection, real-time Range Meter distance bar, incomplete reception recovery, and auto-NACK retransmission.
-  * **DSP Diagnostics Console:** Encode-modulate-demodulate loopback testing, identity inspector, and PHY parameters display.
-
----
-
-## 10. Hardware & Operating Environment
-
-* **Target OS:** Android 7.0+ (API Level 24 through 35+).
-* **Validated Device:** `iQOO I2223` (Android 15, API 35, ARM64-v8a).
-* **Audio Hardware:** Built-in mono/stereo speakers and microphones.
-* **Memory Footprint:** $\approx 45\text{ MB}$ runtime heap; ring buffer consumes only $2.6\text{ MB}$ RAM.
-* **Battery Impact:** Low; Goertzel evaluation runs only over short symbol windows on native coroutines.
-
----
-
-## 11. Verification Matrix
-
-| Test Suite | Target | Status |
+| Test Suite | Target Capability | Status |
 | :--- | :--- | :--- |
 | `testDirectModulateDemodulate` | In-memory encode $\to$ modulate $\to$ demodulate $\to$ decode | **PASSED** |
-| `testDemodulationWithNoiseAndSilencePadding` | Signal with leading/trailing noise & ambient jitter | **PASSED** |
+| `testDemodulationWithNoiseAndSilencePadding` | Signal resilience under background noise & jitter | **PASSED** |
 | `testDemodulationWithChannelGainTilt` | Phone mic high-frequency roll-off (6 dB tilt) | **PASSED** |
-| `testRetransmissionRequestPacket` | NACK packet encoding, parsing, and CRC verification | **PASSED** |
-| `testRangeMeterDistanceEstimation` | Log-distance path loss distance calculation | **PASSED** |
-| `testPingPongPacketEncodingAndParsing` | Acoustic PING broadcast & PONG discovery response parsing | **PASSED** |
-| `testPrivateMessageTargetingAndAck` | Targeted unicast filtering & signed acoustic ACK verification | **PASSED** |
-| `testIdentityGeneration` | Persistent device ID, hex formatting, and ECDSA fingerprint generation | **PASSED** |
-| `flutter test` | Flutter widget hierarchy and routing test suite | **PASSED** |
-| `Live Hardware Validation` | Live Carrier Lock, 2.1m Range Meter, UI telemetry on real phone | **PASSED** |
+| `testRangeMeterDistanceEstimation` | Log-distance path loss distance estimation | **PASSED** |
+| `testPingPongPacketEncodingAndParsing` | Ultrasonic PING discovery & PONG response parsing | **PASSED** |
+| `testPrivateMessageTargetingAndAck` | Targeted unicast filtering & signed acoustic ACK | **PASSED** |
+| `testPersistentBroadcastTimer` | Duration countdown, cached retransmission, cancel | **PASSED** |
+| `testAcousticRelayPipeline` | Store-and-forward digital reconstruction & deduplication | **PASSED** |
+| `testOfflineSpeechRecognition` | Offline voice capture & auto-fill text integration | **PASSED** |
+| `testOfflineTextToSpeech` | Local TTS engine binding, play/pause/stop lifecycle | **PASSED** |
+| `testAcousticImageTransfer` | WebP compression, chunk framing, CRC-32 reassembly | **PASSED** |
+| `flutter test` (8 test suites) | Full widget hierarchy, UI state, and channel mocks | **PASSED** |
+| `Live Hardware Deployment` | Physical Android device (`10BD5H1XDZ0003N`) verification | **PASSED** |
 | `Git Synchronization` | Remote push to `origin main` on GitHub | **PASSED** |
